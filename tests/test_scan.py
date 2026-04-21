@@ -374,3 +374,119 @@ def test_report_includes_source_sink(tmp_path):
     text = output.read_text()
     assert "**Source**: network packet" in text
     assert "**Sink**: strcpy into fixed buffer" in text
+
+
+def test_stage_stats_are_computed_from_progress(tmp_path):
+    session_id, session_dir = scan.make_session_dir(str(tmp_path), "pkg")
+    scan.append_jsonl(session_dir / "progress.jsonl", {
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "stage": "triage",
+        "file": "a.c",
+        "backend": "triage-model",
+        "chunk_count": 1,
+        "finding_count": 0,
+    })
+    scan.append_jsonl(session_dir / "progress.jsonl", {
+        "created_at": "2026-01-01T00:00:01+00:00",
+        "stage": "triage",
+        "file": "b.c",
+        "backend": "triage-model",
+        "chunk_count": 1,
+        "finding_count": 2,
+    })
+    scan.append_jsonl(session_dir / "progress.jsonl", {
+        "created_at": "2026-01-01T00:00:02+00:00",
+        "stage": "reasoning",
+        "file": "b.c",
+        "backend": "reason-model",
+        "chunk_count": 1,
+        "finding_count": 1,
+    })
+
+    stats = scan.compute_stage_stats(session_dir)
+    assert stats["triage"]["completed_files"] == 2
+    assert stats["triage"]["files_with_findings"] == 1
+    assert stats["triage"]["total_findings"] == 2
+    assert stats["reasoning"]["completed_files"] == 1
+    assert stats["verdict"]["completed_files"] == 0
+    assert session_id
+
+
+def test_resume_session_reuses_cached_stage_outputs(tmp_path, monkeypatch):
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "vuln.c").write_text("int main(void) { return 0; }\n")
+    (source_dir / "clean.c").write_text("int ok(void) { return 0; }\n")
+
+    triage = FakeBackend(
+        "gemini/flash",
+        file_responses={
+            "vuln.c": make_finding_text("main()", "overflow", "triage hit"),
+            "clean.c": "CLEAN",
+        },
+    )
+    reasoning = FakeBackend(
+        "claude/sonnet",
+        file_responses={"vuln.c": make_finding_text("main()", "overflow", "reasoning hit")},
+    )
+    backends = {
+        "gemini/flash": triage,
+        "claude/sonnet": reasoning,
+    }
+    monkeypatch.setattr(scan, "parse_backend_spec", lambda spec: backends[spec])
+
+    initial_args = Namespace(
+        source_dir=str(source_dir),
+        obs_package=None,
+        resume_session=None,
+        package_name="pkg",
+        output=str(tmp_path / "report.md"),
+        json=None,
+        scratch_dir=str(tmp_path / "scratch"),
+        triage="gemini/flash",
+        reasoning="claude/sonnet",
+        verdict=None,
+        triage_only=True,
+    )
+    initial = scan.run_pipeline(initial_args)
+    assert triage.seen_files == ["vuln.c", "clean.c"]
+
+    triage.seen_files.clear()
+    resumed_args = Namespace(
+        source_dir=None,
+        obs_package=None,
+        resume_session=initial.session_dir,
+        package_name=None,
+        output=str(tmp_path / "report2.md"),
+        json=None,
+        scratch_dir=str(tmp_path / "scratch"),
+        triage="gemini/flash",
+        reasoning="claude/sonnet",
+        verdict=None,
+        triage_only=True,
+    )
+    resumed = scan.run_pipeline(resumed_args)
+    assert triage.seen_files == []
+    assert resumed.session_id == initial.session_id
+    assert resumed.stage_stats["triage"]["completed_files"] == 2
+
+
+def test_report_includes_stage_summary(tmp_path):
+    result = scan.ScanResult(
+        package="pkg",
+        files_scanned=2,
+        files_with_findings=1,
+        session_id="session",
+        session_dir="/tmp/session",
+        created_at="2026-04-21T12:34:56+00:00",
+        stage_stats={
+            "triage": {"completed_files": 2, "files_with_findings": 1, "total_findings": 2},
+            "reasoning": {"completed_files": 1, "files_with_findings": 1, "total_findings": 1},
+            "verdict": {"completed_files": 0, "files_with_findings": 0, "total_findings": 0},
+        },
+    )
+    output = tmp_path / "report.md"
+    scan.generate_report(result, str(output))
+    text = output.read_text()
+    assert "## Stage Summary" in text
+    assert "- triage: 2 completed, 1 with findings, 2 total findings" in text

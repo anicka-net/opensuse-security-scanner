@@ -5,6 +5,10 @@ Three independent stages — triage, reasoning, verdict — each
 backed by any LLM you choose: local models via ollama/llama.cpp,
 or frontier APIs via Claude, Gemini, or Codex CLIs.
 
+This tool is designed for analyst assistance, not autonomous security
+sign-off. A "clean" report means "nothing survived this pipeline under
+this model mix," not "this package is vulnerability-free."
+
 ## How it works
 
 ```
@@ -50,6 +54,10 @@ python3 scan.py --source-dir /path/to/extracted-source
 python3 scan.py --source-dir ./src --triage-only
 ```
 
+For regular use, prefer local models for triage and reasoning and reserve
+frontier models for verdict or high-value packages. A full frontier run on
+large packages can be slow and expensive.
+
 ## Recommended setup
 
 Based on testing against packages with known vulnerabilities
@@ -57,9 +65,9 @@ Based on testing against packages with known vulnerabilities
 
 | Stage | Model | Why | VRAM |
 |-------|-------|-----|------|
-| Triage | GPT-OSS 20B | Best signal-to-noise. Zero FP on clean files, catches real bugs. MoE, only 3.6B active params. | 13 GB |
-| Reasoning | Gemma 4 31B | Best vulnerability chain analysis in our tests. Nailed strlen->OOB read->OOB write chain that other models missed. | 33 GB |
-| Verdict | Claude / Gemini / Codex | Frontier model for privilege boundary analysis. No local model did this well. | API |
+| Triage | GPT-OSS 20B | Good signal-to-noise in current repo testing. | 13 GB |
+| Reasoning | Gemma 4 31B | Good chain-analysis behavior in current repo testing. | 33 GB |
+| Verdict | Claude / Gemini / Codex | Stronger privilege-boundary and exploitability review. | API |
 
 ```bash
 # Recommended: local triage + reasoning, Claude verdict
@@ -154,7 +162,47 @@ fillup-<uuid>/
 All raw model outputs are preserved for debugging, comparison,
 and reproducibility.
 
+The scanner can also resume a persisted session:
+
+```bash
+python3 scan.py \
+  --resume-session /tmp/opensuse-security-scanner/permissions-<uuid> \
+  --triage openai/gpt-oss-20b@http://localhost:8404 \
+  --reasoning openai/gemma-4-31b@http://localhost:8405
+```
+
+When resuming, already-written stage records are reused and only missing
+files are scanned.
+
+## Example session
+
+Real session layout from a local-model run on `openSUSE:Factory/permissions`:
+
+```text
+/tmp/opensuse-security-scanner/permissions-a0974a27-85a1-43f0-83a5-415f8215dd65/
+  metadata.json
+  progress.jsonl
+  triage/src/varexp.cpp.json
+  reasoning/src/varexp.cpp.json
+```
+
+Example progress funnel from that run:
+
+```text
+triage: 15 completed, 1 file flagged, 1 total finding
+reasoning: 1 completed, 0 surviving findings
+verdict: disabled
+```
+
+The per-file JSON artifacts preserve both the raw model output and the parsed
+finding structure, so you can inspect why a file was flagged or cleared without
+re-running the scan.
+
 ## Model comparison results
+
+These notes are early directional observations from local testing, not a
+benchmark suite and not a publishable claim set. Treat them as operator
+guidance only.
 
 Tested on open-iscsi (confirmed strlen vulnerability) and
 transactional-update (confirmed popen injection). Same prompt,
@@ -163,12 +211,10 @@ same files:
 | Model | dhcpv6 strlen (subtle) | popen injection (obvious) | FP noise |
 |-------|------------------------|--------------------------|----------|
 | GPT-OSS 20B (3.6B active) | Found | Found | Low |
-| Gemma 4 31B | **Best** — traced full chain | Found + novel extras | Medium |
+| Gemma 4 31B | Strong — traced full chain | Found + novel extras | Medium |
 | GPT-OSS 120B (5.1B active) | Found | Found | Medium |
 | Qwen3 32B | Partial — missed root cause | Found | Medium |
 | Devstral Small 2 24B | Partial — wrong root cause | Found | **Very high** (100 FP on 4 clean files) |
-
-Full comparison: [reports/model-comparison.md](reports/model-comparison.md)
 
 ## Requirements
 
