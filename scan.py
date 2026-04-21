@@ -59,7 +59,7 @@ import requests
 
 # ── Prompt ──────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """\
+TRIAGE_PROMPT = """\
 You are a paranoid security auditor with decades of experience finding bugs in C/C++ code.
 Your job is to find REAL vulnerabilities that could be exploited by an attacker.
 
@@ -93,25 +93,82 @@ END_FINDING
 If the code is genuinely clean, say exactly: CLEAN
 Do NOT report style issues, missing comments, or theoretical concerns that require impossible preconditions."""
 
+REASONING_PROMPT = """\
+You are a vulnerability researcher performing deep analysis of C/C++ code.
+Your goal is to find exploitable vulnerabilities by tracing data flow and
+reasoning about execution paths — not just pattern matching.
+
+Do NOT flag surface-level patterns. Instead, for each potential vulnerability
+you MUST trace the complete chain:
+
+1. SOURCE: Where does untrusted data enter? (network packet, file content,
+   environment variable, user input, IPC message, command-line argument)
+2. SINK: Where does it reach a dangerous operation? (memcpy, strcpy, system,
+   popen, strlen on raw buffers, array index, format string argument)
+3. PATH: What happens between source and sink? Do bounds checks actually
+   protect? Do error handlers terminate the process or fall through?
+   Does integer promotion change signedness? Can the length wrap around?
+4. CONTEXT: Who calls this function? What privilege level does the process
+   run at? Is the input actually attacker-controlled in a real deployment?
+
+Before reporting, rule out these common false positive patterns:
+- Allocators that abort on failure (g_malloc, xmalloc, solv_malloc) —
+  NULL derefs after these are unreachable
+- Error handlers that call exit(), abort(), die(), bug() — code after
+  them is dead
+- Format string functions where ALL callers pass string literals
+- Signed/unsigned comparisons where C integer promotion rules prevent
+  the negative case
+- Functions only reachable from root-owned contexts (installers, init
+  scripts, privileged daemons with no untrusted input path)
+
+Report only findings where you can describe a complete source-to-sink path
+with attacker-controlled data. Quality over quantity.
+
+For each finding report in this exact format:
+
+FINDING:
+SEVERITY: Critical/High/Medium/Low
+LOCATION: function_name (file context)
+TYPE: vulnerability category
+SOURCE: where untrusted data enters
+SINK: where the dangerous operation is
+DESCRIPTION: the complete vulnerability chain, step by step
+EXPLOITATION: concrete attack scenario with attacker prerequisites
+END_FINDING
+
+If the code is genuinely clean after this analysis, say exactly: CLEAN"""
+
+STAGE_PROMPTS = {
+    "triage": TRIAGE_PROMPT,
+    "reasoning": REASONING_PROMPT,
+}
+
 VERDICT_PROMPT_TEMPLATE = """\
-You are reviewing security scan findings for {filename}.
+You are the final reviewer in a multi-stage security scanning pipeline
+for {filename}. Two independent scanners have already analyzed this code:
 
-Previous scanners flagged the following potential issues:
+**Stage 1 — Triage** (fast pattern matching, errs on the side of flagging):
+{triage_findings}
 
-{findings_context}
+**Stage 2 — Reasoning** (deep chain analysis, traces data flow source→sink):
+{reasoning_findings}
 
-Your job is to verify each finding:
+{consensus_note}
+
+Your job is to deliver the final verdict on each finding:
 1. Is it a REAL vulnerability or a false positive?
 2. If real, is it actually EXPLOITABLE? Check:
    - Who controls the input? (user, network, root-only, internal)
-   - What privilege boundary is crossed?
-   - What is the actual attack surface?
-3. Rate the real-world severity.
+   - What privilege boundary is crossed? (Is there D-Bus policy, sd-bus
+     vtable enforcement, filesystem permissions, or other access control?)
+   - What is the realistic attack surface?
+3. Rate the real-world severity — not the theoretical worst case.
 
 For each finding, respond:
 VERDICT: [CONFIRMED|FALSE_POSITIVE|NEEDS_CONTEXT]
 REAL_SEVERITY: [Critical|High|Medium|Low|None]
-REASONING: [why]
+REASONING: [why — be specific about what makes it real or false]
 
 Source code:
 ```
@@ -131,6 +188,8 @@ class Finding:
     file: str
     model: str
     stage: str
+    source: str = ""   # reasoning stage: where untrusted data enters
+    sink: str = ""     # reasoning stage: where the dangerous op is
 
     def key(self) -> str:
         """Normalized key for dedup/consensus."""
@@ -538,7 +597,9 @@ def parse_findings(raw: str, filename: str, model: str, stage: str) -> List[Find
     for block in blocks[1:]:
         severity = _extract(block, r"SEVERITY:\s*(\w+)")
         location = _extract(block, r"LOCATION:\s*(.+?)(?:\n|TYPE:)")
-        ftype = _extract(block, r"TYPE:\s*(.+?)(?:\n|DESCRIPTION:)")
+        ftype = _extract(block, r"TYPE:\s*(.+?)(?:\n|DESCRIPTION:|SOURCE:)")
+        source = _extract(block, r"SOURCE:\s*(.+?)(?:\n|SINK:)")
+        sink = _extract(block, r"SINK:\s*(.+?)(?:\n|DESCRIPTION:)")
         desc = _extract(block, r"DESCRIPTION:\s*(.+?)(?:\n(?:EXPLOITATION|END_FINDING))", re.DOTALL)
         exploit = _extract(block, r"EXPLOITATION:\s*(.+?)(?:\n(?:END_FINDING|FINDING|$))", re.DOTALL)
 
@@ -552,6 +613,8 @@ def parse_findings(raw: str, filename: str, model: str, stage: str) -> List[Find
                 file=filename,
                 model=model,
                 stage=stage,
+                source=(source or "").strip(),
+                sink=(sink or "").strip(),
             ))
 
     # Fallback: unstructured SEVERITY: lines (DOTALL so we cross newlines)
@@ -628,7 +691,8 @@ def run_scan_stage(files: List[Path], backend: Backend,
                 label = f"{relpath} (part {ci+1}/{len(chunks)})"
             user_msg = f"SOURCE FILE: {label}\n```\n{chunk}\n```"
 
-            raw = backend.query(SYSTEM_PROMPT, user_msg)
+            system_prompt = STAGE_PROMPTS.get(stage_name, TRIAGE_PROMPT)
+            raw = backend.query(system_prompt, user_msg)
             findings = parse_findings(raw, relpath, repr(backend), stage_name)
             chunk_records.append({
                 "chunk_index": ci + 1,
@@ -658,13 +722,36 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
         code = full_code[:30000]
         if len(full_code) > 30000:
             code += f"\n\n... [{len(full_code) - 30000} chars truncated] ..."
-        findings_text = "\n".join(
-            f"- [{f.severity}] {f.location}: {f.description}"
-            for f in group["findings"]
-        )
+        # Format findings by stage so verdict sees what each scanner found
+        triage_items = [f for f in group["findings"] if f.stage == "triage"]
+        reasoning_items = [f for f in group["findings"] if f.stage == "reasoning"]
+
+        def _fmt_findings(items):
+            if not items:
+                return "(not flagged by this stage)"
+            lines = []
+            for f in items:
+                line = f"- [{f.severity}] {f.location}: {f.description}"
+                if f.source:
+                    line += f"\n  Source: {f.source}"
+                if f.sink:
+                    line += f"\n  Sink: {f.sink}"
+                lines.append(line)
+            return "\n".join(lines)
+
+        if group["count"] > 1:
+            consensus_note = ("Both stages independently flagged this location — "
+                              "higher confidence this is a real issue.")
+        else:
+            stage = list(group["stages"])[0] if group.get("stages") else "unknown"
+            consensus_note = (f"Only flagged by {stage} stage — "
+                              f"the other stage did not find this. Examine carefully.")
+
         prompt = VERDICT_PROMPT_TEMPLATE.format(
             filename=group["findings"][0].file,
-            findings_context=findings_text,
+            triage_findings=_fmt_findings(triage_items),
+            reasoning_findings=_fmt_findings(reasoning_items),
+            consensus_note=consensus_note,
             code=code,
         )
         raw = backend.query("", prompt)
@@ -860,6 +947,10 @@ def generate_report(result: ScanResult, output_path: str):
             lines.append(f"**File**: {f.file}")
             lines.append(f"**Type**: {f.type}")
             lines.append(f"**Model**: {f.model} (stage: {f.stage})")
+            if f.source:
+                lines.append(f"**Source**: {f.source}")
+            if f.sink:
+                lines.append(f"**Sink**: {f.sink}")
             lines.append(f"**Description**: {f.description}")
             if f.exploitation:
                 lines.append(f"**Exploitation**: {f.exploitation}")
