@@ -200,8 +200,7 @@ def test_generate_report_includes_session_metadata(tmp_path):
     text = output.read_text()
 
     assert "**Date**: 2026-04-21T12:34:56+00:00" in text
-    assert "**Session UUID**: 1234-session" in text
-    assert "**Session Dir**: /tmp/opensuse-security-scanner/libzypp-1234-session" in text
+    assert "**Session**: 1234-session" in text
 
 
 # ── Prompt selection ───────────────────────────────────────────────────
@@ -554,8 +553,8 @@ def test_report_includes_stage_summary(tmp_path):
     output = tmp_path / "report.md"
     scan.generate_report(result, str(output))
     text = output.read_text()
-    assert "## Stage Summary" in text
-    assert "- triage: 2 completed, 1 with findings, 2 total findings" in text
+    assert "## Scan funnel" in text
+    assert "**Triage**: 2 files, 1 with findings, 2 total findings" in text
 
 
 def test_main_loads_config_file(tmp_path):

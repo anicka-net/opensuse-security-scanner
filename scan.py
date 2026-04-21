@@ -1323,6 +1323,83 @@ def run_scan_stage(files: List[SourceFile], backend: Backend,
         save_stage_file_output(session_dir, stage_name, backend, relpath, chunk_records)
 
 
+def find_cross_references(finding: Finding, source_dir: str,
+                          finding_file: str) -> str:
+    """Find call sites of the flagged function across the source tree.
+
+    Extracts a function/class name from the finding location, greps
+    the source tree for references in OTHER files, and returns context
+    snippets showing how the vulnerable code is actually invoked.
+    """
+    # Extract the function/method name from the finding location
+    # e.g., "Util::exec (lib/Util.cpp)" → "Util::exec"
+    # e.g., "closeSnapshot" → "closeSnapshot"
+    location = finding.location or ""
+    # Try to extract a searchable identifier
+    candidates = []
+    # "Class::method" or "function_name"
+    match = re.match(r'(\w+(?:::\w+)?)', location)
+    if match:
+        candidates.append(match.group(1))
+    # Also check the sink field — often has the specific function
+    if finding.sink:
+        sink_match = re.match(r'[`]?(\w+(?:::\w+)?)', finding.sink)
+        if sink_match:
+            candidates.append(sink_match.group(1))
+
+    if not candidates:
+        return ""
+
+    snippets = []
+    budget = 6000  # chars budget for cross-references
+    src = Path(source_dir)
+
+    for term in candidates:
+        # Skip very generic terms
+        if term.lower() in ("return", "if", "for", "while", "int", "void",
+                            "string", "char", "bool", "auto", "const"):
+            continue
+        try:
+            result = subprocess.run(
+                ["grep", "-rn", "--include=*.cpp", "--include=*.c",
+                 "--include=*.h", "--include=*.hpp",
+                 "--include=*.py", "--include=*.rb", "--include=*.sh",
+                 "--include=*.rs", "--include=*.js", "--include=*.ts",
+                 "--include=*.pl", "--include=*.pm",
+                 term, source_dir],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+
+        for line in result.stdout.splitlines():
+            # Skip matches in the same file (verdict already sees it)
+            try:
+                match_file = line.split(":", 1)[0]
+                relpath = str(Path(match_file).relative_to(src))
+            except (ValueError, IndexError):
+                continue
+            if relpath == finding_file:
+                continue
+            # Include this cross-reference
+            snippet = line.replace(source_dir + "/", "")
+            if len(snippet) <= budget:
+                snippets.append(snippet)
+                budget -= len(snippet) + 1
+            if budget <= 0:
+                break
+        if budget <= 0:
+            break
+
+    if not snippets:
+        return ""
+
+    return (
+        "\n\nCROSS-REFERENCES (call sites of flagged functions in other files):\n"
+        + "\n".join(snippets)
+    )
+
+
 def run_verdict_stage(consensus: List[dict], backend: Backend,
                       source_dir: str, session_dir: Path,
                       profile_by_file: dict) -> List[dict]:
@@ -1341,6 +1418,16 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
         code = full_code[:30000]
         if len(full_code) > 30000:
             code += f"\n\n... [{len(full_code) - 30000} chars truncated] ..."
+
+        # Find cross-references: how are the flagged functions called
+        # from other files? This gives verdict the caller context it
+        # needs to assess exploitability without seeing every file.
+        xrefs = ""
+        for f in group["findings"]:
+            xrefs += find_cross_references(
+                f, source_dir, group["findings"][0].file
+            )
+
         # Format findings by stage so verdict sees what each scanner found
         triage_items = [f for f in group["findings"] if f.stage == "triage"]
         reasoning_items = [f for f in group["findings"] if f.stage == "reasoning"]
@@ -1352,7 +1439,7 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
             reasoning_findings=format_findings_for_verdict(reasoning_items),
             consensus_note=consensus_note,
             hypothesis_note=hypothesis_note,
-            code=code,
+            code=code + xrefs,
         )
         raw = backend.query("", prompt)
         group["verdict_raw"] = raw
@@ -1563,55 +1650,114 @@ def run_pipeline(args) -> ScanResult:
 # ── Report generation ───────────────────────────────────────────────────
 
 def generate_report(result: ScanResult, output_path: str):
-    """Generate a markdown report."""
+    """Generate a markdown report with verdict results when available."""
+    session_dir = Path(result.session_dir) if result.session_dir else None
+
+    # Load verdict data if available
+    verdict_groups: Dict[str, List[dict]] = {"CONFIRMED": [], "FALSE_POSITIVE": [], "NEEDS_CONTEXT": []}
+    if session_dir and (session_dir / "verdict").exists():
+        for path in sorted((session_dir / "verdict").rglob("*.json")):
+            payload = load_json(path)
+            v = payload.get("verdict", "NEEDS_CONTEXT")
+            verdict_groups.setdefault(v, []).append(payload)
+
+    has_verdicts = any(verdict_groups.values())
+
     lines = [
         f"# {result.package} Security Scan Report\n",
         f"**Date**: {result.created_at}",
-        f"**Session UUID**: {result.session_id}",
-        f"**Session Dir**: {result.session_dir}",
-        f"**Files scanned**: {result.files_scanned}",
-        f"**Files with findings**: {result.files_with_findings}",
-        f"**Total findings**: {len(result.findings)}\n",
+        f"**Session**: {result.session_id}\n",
     ]
 
+    # Stage summary
     if result.stage_stats:
-        lines.append("## Stage Summary\n")
+        lines.append("## Scan funnel\n")
+        lines.append(f"- **Files scanned**: {result.files_scanned}")
         for stage in ("triage", "reasoning", "verdict"):
             stats = result.stage_stats.get(stage)
             if not stats:
                 continue
             lines.append(
-                f"- {stage}: {stats['completed_files']} completed, "
+                f"- **{stage.capitalize()}**: {stats['completed_files']} files, "
                 f"{stats['files_with_findings']} with findings, "
                 f"{stats['total_findings']} total findings"
             )
+        if has_verdicts:
+            lines.append(
+                f"- **Verdict confirmed**: {len(verdict_groups.get('CONFIRMED', []))} | "
+                f"**False positive**: {len(verdict_groups.get('FALSE_POSITIVE', []))} | "
+                f"**Needs context**: {len(verdict_groups.get('NEEDS_CONTEXT', []))}"
+            )
         lines.append("")
 
-    if result.findings:
+    # When verdicts exist, report by verdict status
+    if has_verdicts:
+        if verdict_groups.get("CONFIRMED"):
+            lines.append("## Confirmed findings\n")
+            for payload in verdict_groups["CONFIRMED"]:
+                _format_verdict_finding(lines, payload)
+
+        if verdict_groups.get("NEEDS_CONTEXT"):
+            lines.append("## Findings needing additional context\n")
+            for payload in verdict_groups["NEEDS_CONTEXT"]:
+                _format_verdict_finding(lines, payload)
+
+        if verdict_groups.get("FALSE_POSITIVE"):
+            lines.append("## Filtered as false positive\n")
+            for payload in verdict_groups["FALSE_POSITIVE"]:
+                finding = payload.get("findings", [{}])[0]
+                lines.append(
+                    f"- ~~[{finding.get('severity', '?')}] "
+                    f"{payload.get('file', '?')}: "
+                    f"{finding.get('type', '?')}~~"
+                )
+            lines.append("")
+    elif result.findings:
+        # No verdict — list raw findings
         lines.append("## Findings\n")
         for f in result.findings:
             lines.append(f"### [{f.severity}] {f.location}")
             lines.append(f"**File**: {f.file}")
             lines.append(f"**Type**: {f.type}")
-            lines.append(f"**Model**: {f.model} (stage: {f.stage})")
+            lines.append(f"**Stage**: {f.stage} ({f.model})")
             if f.source:
                 lines.append(f"**Source**: {f.source}")
             if f.sink:
                 lines.append(f"**Sink**: {f.sink}")
-            lines.append(f"**Description**: {f.description}")
-            if f.exploitation:
-                lines.append(f"**Exploitation**: {f.exploitation}")
-            lines.append("")
+            lines.append(f"\n{f.description}\n")
 
     if result.clean_files:
         lines.append("## Files confirmed clean\n")
-        for f in result.clean_files:
-            lines.append(f"- {f}")
+        lines.append(f"{len(result.clean_files)} files passed all stages.\n")
 
     report = "\n".join(lines)
     with open(output_path, "w") as f:
         f.write(report)
     print(f"\nReport written to {output_path}", flush=True)
+
+
+def _format_verdict_finding(lines: list, payload: dict):
+    """Format a single verdict finding for the report."""
+    finding = payload.get("findings", [{}])[0]
+    stages = payload.get("stages", [])
+    stage_str = " + ".join(stages) if stages else "?"
+
+    lines.append(f"### [{finding.get('severity', '?')}] {finding.get('location', '?')}")
+    lines.append(f"**File**: {payload.get('file', '?')}")
+    lines.append(f"**Type**: {finding.get('type', '?')}")
+    lines.append(f"**Stages**: {stage_str}")
+    if finding.get("source"):
+        lines.append(f"**Source**: {finding['source']}")
+    if finding.get("sink"):
+        lines.append(f"**Sink**: {finding['sink']}")
+    lines.append(f"\n{finding.get('description', '')}")
+
+    # Include verdict reasoning if available
+    verdict_raw = payload.get("verdict_raw", "")
+    reasoning_match = re.search(r"REASONING:\s*(.+?)(?:\n\n|\Z)", verdict_raw, re.DOTALL)
+    if reasoning_match:
+        lines.append(f"\n**Verdict reasoning**: {reasoning_match.group(1).strip()[:500]}")
+    lines.append("")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────
