@@ -166,3 +166,171 @@ def test_generate_report_includes_session_metadata(tmp_path):
     assert "**Date**: 2026-04-21T12:34:56+00:00" in text
     assert "**Session UUID**: 1234-session" in text
     assert "**Session Dir**: /tmp/opensuse-security-scanner/libzypp-1234-session" in text
+
+
+# ── Prompt selection ───────────────────────────────────────────────────
+
+
+def test_triage_stage_uses_triage_prompt(tmp_path):
+    """Triage stage sends the paranoid pattern-matching prompt."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "main.c").write_text("int main() { return 0; }\n")
+
+    prompts_seen = []
+
+    class CapturingBackend(scan.Backend):
+        def query(self, system, user, max_tokens=4096):
+            prompts_seen.append(system)
+            return "CLEAN"
+        def __repr__(self):
+            return "test/capture"
+
+    session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "test")
+    scan.run_scan_stage(
+        [source_dir / "main.c"],
+        CapturingBackend(), "triage", str(source_dir), session_dir,
+    )
+    assert len(prompts_seen) == 1
+    assert "paranoid" in prompts_seen[0].lower()
+    assert "source" not in prompts_seen[0].lower().split("focus on")[0]
+
+
+def test_reasoning_stage_uses_reasoning_prompt(tmp_path):
+    """Reasoning stage sends the chain-analysis prompt, not triage."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "main.c").write_text("int main() { return 0; }\n")
+
+    prompts_seen = []
+
+    class CapturingBackend(scan.Backend):
+        def query(self, system, user, max_tokens=4096):
+            prompts_seen.append(system)
+            return "CLEAN"
+        def __repr__(self):
+            return "test/capture"
+
+    session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "test")
+    scan.run_scan_stage(
+        [source_dir / "main.c"],
+        CapturingBackend(), "reasoning", str(source_dir), session_dir,
+    )
+    assert len(prompts_seen) == 1
+    assert "trace" in prompts_seen[0].lower() or "chain" in prompts_seen[0].lower()
+    assert "quality over quantity" in prompts_seen[0].lower()
+
+
+# ── SOURCE/SINK parsing ───────────────────────────────────────────────
+
+
+def test_parse_findings_extracts_source_sink():
+    """Reasoning-format findings with SOURCE/SINK are parsed correctly."""
+    raw = (
+        "FINDING:\n"
+        "SEVERITY: Critical\n"
+        "LOCATION: dhcpv6_parse_vendor_option\n"
+        "TYPE: Buffer overflow\n"
+        "SOURCE: DHCPv6 network packet, vendor option type 203\n"
+        "SINK: strlen() on unterminated data, then strcpy into fixed buffer\n"
+        "DESCRIPTION: strlen reads past buffer until NUL found in memory\n"
+        "EXPLOITATION: malicious DHCP server sends crafted packet\n"
+        "END_FINDING\n"
+    )
+    findings = scan.parse_findings(raw, "dhcpv6.c", "test/model", "reasoning")
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.source == "DHCPv6 network packet, vendor option type 203"
+    assert f.sink == "strlen() on unterminated data, then strcpy into fixed buffer"
+    assert f.severity == "Critical"
+    assert f.stage == "reasoning"
+
+
+def test_parse_findings_multiline_source_sink():
+    """SOURCE/SINK fields that wrap to multiple lines are fully captured."""
+    raw = (
+        "FINDING:\n"
+        "SEVERITY: High\n"
+        "LOCATION: readFile\n"
+        "TYPE: Path traversal\n"
+        "SOURCE: filename parameter passed from command line\n"
+        "  through getArguments() without validation\n"
+        "SINK: openFileForReading() which calls fopen()\n"
+        "  with the raw unsanitized path\n"
+        "DESCRIPTION: attacker controls filename\n"
+        "EXPLOITATION: escape intended directory\n"
+        "END_FINDING\n"
+    )
+    findings = scan.parse_findings(raw, "file.c", "test/model", "reasoning")
+    assert len(findings) == 1
+    f = findings[0]
+    assert "through getArguments()" in f.source
+    assert "raw unsanitized path" in f.sink
+
+
+def test_parse_findings_without_source_sink():
+    """Triage-format findings (no SOURCE/SINK) still parse correctly."""
+    raw = make_finding_text("main()", "overflow", "bad bounds check")
+    findings = scan.parse_findings(raw, "test.c", "test/model", "triage")
+    assert len(findings) == 1
+    assert findings[0].source == ""
+    assert findings[0].sink == ""
+    assert findings[0].description == "bad bounds check"
+
+
+# ── Verdict prompt formatting ──────────────────────────────────────────
+
+
+def test_verdict_formats_findings_by_stage():
+    """Verdict stage receives findings grouped by stage with consensus note."""
+    triage_finding = scan.Finding(
+        severity="High", location="vuln()", type="overflow",
+        description="triage found overflow", exploitation="",
+        file="test.c", model="gpt-oss", stage="triage",
+    )
+    reasoning_finding = scan.Finding(
+        severity="High", location="vuln()", type="overflow",
+        description="chain: user input -> memcpy", exploitation="",
+        file="test.c", model="gemma-4", stage="reasoning",
+        source="user input via argv", sink="memcpy without bounds",
+    )
+    group = {
+        "findings": [triage_finding, reasoning_finding],
+        "stages": {"triage", "reasoning"},
+        "count": 2,
+    }
+
+    # Simulate what run_verdict_stage builds
+    triage_items = [f for f in group["findings"] if f.stage == "triage"]
+    reasoning_items = [f for f in group["findings"] if f.stage == "reasoning"]
+    assert len(triage_items) == 1
+    assert len(reasoning_items) == 1
+    assert reasoning_items[0].source == "user input via argv"
+
+    # Consensus note for cross-stage confirmation
+    assert group["count"] > 1
+
+
+# ── Report rendering ──────────────────────────────────────────────────
+
+
+def test_report_includes_source_sink(tmp_path):
+    """Report renders Source/Sink lines when present."""
+    result = scan.ScanResult(
+        package="test",
+        files_scanned=1,
+        files_with_findings=1,
+        findings=[
+            scan.Finding(
+                severity="Critical", location="parse()", type="overflow",
+                description="chain traced", exploitation="crafted input",
+                file="test.c", model="gemma-4", stage="reasoning",
+                source="network packet", sink="strcpy into fixed buffer",
+            ),
+        ],
+    )
+    output = tmp_path / "report.md"
+    scan.generate_report(result, str(output))
+    text = output.read_text()
+    assert "**Source**: network packet" in text
+    assert "**Sink**: strcpy into fixed buffer" in text

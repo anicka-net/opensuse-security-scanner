@@ -598,8 +598,8 @@ def parse_findings(raw: str, filename: str, model: str, stage: str) -> List[Find
         severity = _extract(block, r"SEVERITY:\s*(\w+)")
         location = _extract(block, r"LOCATION:\s*(.+?)(?:\n|TYPE:)")
         ftype = _extract(block, r"TYPE:\s*(.+?)(?:\n|DESCRIPTION:|SOURCE:)")
-        source = _extract(block, r"SOURCE:\s*(.+?)(?:\n|SINK:)")
-        sink = _extract(block, r"SINK:\s*(.+?)(?:\n|DESCRIPTION:)")
+        source = _extract(block, r"SOURCE:\s*(.+?)(?=\nSINK:|\nDESCRIPTION:|\nEND_FINDING|\Z)", re.DOTALL)
+        sink = _extract(block, r"SINK:\s*(.+?)(?=\nDESCRIPTION:|\nEND_FINDING|\Z)", re.DOTALL)
         desc = _extract(block, r"DESCRIPTION:\s*(.+?)(?:\n(?:EXPLOITATION|END_FINDING))", re.DOTALL)
         exploit = _extract(block, r"EXPLOITATION:\s*(.+?)(?:\n(?:END_FINDING|FINDING|$))", re.DOTALL)
 
