@@ -454,6 +454,7 @@ def _resolve_c_includes(code: str, source_dir: str, filepath: Path) -> str:
     if not includes:
         return ""
 
+    source_root = Path(source_dir)
     base_dir = filepath.parent
     snippets = []
     seen = set()
@@ -464,11 +465,25 @@ def _resolve_c_includes(code: str, source_dir: str, filepath: Path) -> str:
             continue
         seen.add(inc)
 
-        # Search relative to file, then in source tree
-        candidates = [base_dir / inc]
-        candidates.extend(Path(source_dir).rglob(Path(inc).name))
+        # Search relative to the current file first, then preserve the
+        # include path within the source tree before falling back to
+        # basename-only matching for simple includes like "foo.h".
+        candidates = [base_dir / inc, source_root / inc]
+        if "/" in inc:
+            candidates.extend(source_root.rglob(inc))
+        else:
+            candidates.extend(source_root.rglob(Path(inc).name))
 
+        unique_candidates = []
+        seen_candidates = set()
         for candidate in candidates:
+            candidate = candidate.resolve()
+            if candidate in seen_candidates:
+                continue
+            seen_candidates.add(candidate)
+            unique_candidates.append(candidate)
+
+        for candidate in unique_candidates:
             if candidate.is_file():
                 try:
                     header = candidate.read_text(errors="replace")
@@ -478,7 +493,7 @@ def _resolve_c_includes(code: str, source_dir: str, filepath: Path) -> str:
                 # definitions, typedefs, #define macros for key constants
                 decls = _extract_c_declarations(header)
                 if decls:
-                    rel = str(candidate.relative_to(source_dir)) if str(candidate).startswith(source_dir) else str(candidate)
+                    rel = str(candidate.relative_to(source_root)) if candidate.is_relative_to(source_root) else str(candidate)
                     snippet = f"// --- {rel} (declarations) ---\n{decls}"
                     if len(snippet) <= budget:
                         snippets.append(snippet)
@@ -578,6 +593,316 @@ def _extract_python_declarations(content: str) -> str:
     return "\n".join(result)
 
 
+def _resolve_node_imports(code: str, source_dir: str, filepath: Path) -> str:
+    """Resolve local relative imports for Node.js / TypeScript files."""
+    source_root = Path(source_dir)
+    snippets = []
+    seen = set()
+    budget = HEADER_BUDGET
+
+    patterns = [
+        r'import\s+(?:[^"\']+\s+from\s+)?["\'](\.{1,2}/[^"\']+)["\']',
+        r'export\s+\*\s+from\s+["\'](\.{1,2}/[^"\']+)["\']',
+        r'require\(\s*["\'](\.{1,2}/[^"\']+)["\']\s*\)',
+    ]
+    imports = []
+    for pattern in patterns:
+        imports.extend(re.findall(pattern, code))
+
+    for mod in imports:
+        if mod in seen:
+            continue
+        seen.add(mod)
+
+        candidates = _node_module_candidates(filepath, mod)
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            try:
+                content = candidate.read_text(errors="replace")
+            except OSError:
+                continue
+            decls = _extract_node_declarations(content)
+            if decls:
+                rel = str(candidate.relative_to(source_root)) if candidate.is_relative_to(source_root) else str(candidate)
+                snippet = f"// --- {rel} (declarations) ---\n{decls}"
+                if len(snippet) <= budget:
+                    snippets.append(snippet)
+                    budget -= len(snippet)
+            break
+
+    return "\n".join(snippets)
+
+
+def _node_module_candidates(filepath: Path, mod: str) -> List[Path]:
+    """Return candidate file paths for a relative Node.js module import."""
+    base = filepath.parent / mod
+    extensions = ["", ".js", ".mjs", ".cjs", ".ts"]
+    candidates = [base.with_suffix(ext) if ext else base for ext in extensions]
+    candidates.extend((base / "index").with_suffix(ext) for ext in extensions[1:])
+    return _dedupe_paths(candidates)
+
+
+def _extract_node_declarations(content: str) -> str:
+    """Extract function/class/type declarations from Node.js / TypeScript files."""
+    lines = content.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r'^(export\s+)?(async\s+)?function\s+\w+', stripped):
+            result.append(stripped)
+            continue
+        if re.match(r'^(export\s+)?class\s+\w+', stripped):
+            result.append(stripped)
+            continue
+        if re.match(r'^(export\s+)?(const|let|var)\s+\w+\s*=\s*(async\s*)?(\([^)]*\)|\w+)\s*=>', stripped):
+            result.append(stripped)
+            continue
+        if re.match(r'^(export\s+)?(interface|type|enum)\s+\w+', stripped):
+            result.append(stripped)
+            continue
+    return "\n".join(result)
+
+
+def _resolve_ruby_requires(code: str, source_dir: str, filepath: Path) -> str:
+    """Resolve local Ruby require_relative and relative require directives."""
+    source_root = Path(source_dir)
+    snippets = []
+    seen = set()
+    budget = HEADER_BUDGET
+
+    requires = re.findall(r'require_relative\s+["\']([^"\']+)["\']', code)
+    requires.extend(
+        mod for mod in re.findall(r'require\s+["\']([^"\']+)["\']', code)
+        if mod.startswith(("./", "../"))
+    )
+
+    for mod in requires:
+        if mod in seen:
+            continue
+        seen.add(mod)
+
+        base = (filepath.parent / mod) if mod.startswith(("./", "../")) else (filepath.parent / mod)
+        candidates = _dedupe_paths([base, base.with_suffix(".rb")])
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            try:
+                content = candidate.read_text(errors="replace")
+            except OSError:
+                continue
+            decls = _extract_ruby_declarations(content)
+            if decls:
+                rel = str(candidate.relative_to(source_root)) if candidate.is_relative_to(source_root) else str(candidate)
+                snippet = f"# --- {rel} (declarations) ---\n{decls}"
+                if len(snippet) <= budget:
+                    snippets.append(snippet)
+                    budget -= len(snippet)
+            break
+
+    return "\n".join(snippets)
+
+
+def _extract_ruby_declarations(content: str) -> str:
+    """Extract method/class/module declarations from Ruby source."""
+    lines = content.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r'^(class|module)\s+[A-Z]\w*(::[A-Z]\w*)*', stripped):
+            result.append(stripped)
+            continue
+        if re.match(r'^def\s+(self\.)?\w+[!?=]?', stripped):
+            result.append(stripped)
+            continue
+    return "\n".join(result)
+
+
+def _resolve_perl_imports(code: str, source_dir: str, filepath: Path) -> str:
+    """Resolve local Perl modules loaded via use/require."""
+    source_root = Path(source_dir)
+    lib_dirs = [filepath.parent, source_root]
+    snippets = []
+    seen = set()
+    budget = HEADER_BUDGET
+
+    for lib_dir in re.findall(r'use\s+lib\s+["\']([^"\']+)["\']', code):
+        lib_dirs.append((filepath.parent / lib_dir).resolve())
+
+    modules = []
+    modules.extend(("file", match) for match in re.findall(r'require\s+["\']([^"\']+)["\']', code))
+    modules.extend(("module", match) for match in re.findall(r'(?:use|require)\s+([A-Za-z_]\w*(?:::\w+)*)\s*[;)]', code))
+
+    for kind, mod in modules:
+        key = (kind, mod)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if kind == "file":
+            base = filepath.parent / mod
+            candidates = [base]
+        else:
+            rel = Path(*mod.split("::")).with_suffix(".pm")
+            candidates = [lib_dir / rel for lib_dir in lib_dirs]
+
+        for candidate in _dedupe_paths(candidates):
+            if not candidate.is_file():
+                continue
+            try:
+                content = candidate.read_text(errors="replace")
+            except OSError:
+                continue
+            decls = _extract_perl_declarations(content)
+            if decls:
+                rel = str(candidate.relative_to(source_root)) if candidate.is_relative_to(source_root) else str(candidate)
+                snippet = f"# --- {rel} (declarations) ---\n{decls}"
+                if len(snippet) <= budget:
+                    snippets.append(snippet)
+                    budget -= len(snippet)
+            break
+
+    return "\n".join(snippets)
+
+
+def _extract_perl_declarations(content: str) -> str:
+    """Extract package and sub declarations from Perl source."""
+    lines = content.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r'^package\s+\w+(?:::\w+)*\s*;', stripped):
+            result.append(stripped)
+            continue
+        if re.match(r'^sub\s+\w+', stripped):
+            result.append(stripped)
+            continue
+        if re.match(r'^use\s+constant\s+\w+', stripped):
+            result.append(stripped)
+            continue
+    return "\n".join(result)
+
+
+def _resolve_rust_modules(code: str, source_dir: str, filepath: Path) -> str:
+    """Resolve local Rust modules referenced by mod/use statements."""
+    source_root = Path(source_dir)
+    crate_root = _guess_rust_crate_root(source_root, filepath)
+    snippets = []
+    seen = set()
+    budget = HEADER_BUDGET
+
+    mod_names = re.findall(r'^\s*(?:pub\s+)?mod\s+([A-Za-z_]\w*)\s*;', code, re.MULTILINE)
+    use_specs = re.findall(r'^\s*use\s+([^;]+);', code, re.MULTILINE)
+
+    candidates = []
+    for name in mod_names:
+        candidates.extend(_rust_mod_candidates(filepath.parent, name))
+
+    for spec in use_specs:
+        candidates.extend(_rust_use_candidates(spec, filepath, crate_root))
+
+    for candidate in _dedupe_paths(candidates):
+        key = str(candidate)
+        if key in seen or not candidate.is_file():
+            continue
+        seen.add(key)
+        try:
+            content = candidate.read_text(errors="replace")
+        except OSError:
+            continue
+        decls = _extract_rust_declarations(content)
+        if decls:
+            rel = str(candidate.relative_to(source_root)) if candidate.is_relative_to(source_root) else str(candidate)
+            snippet = f"// --- {rel} (declarations) ---\n{decls}"
+            if len(snippet) <= budget:
+                snippets.append(snippet)
+                budget -= len(snippet)
+
+    return "\n".join(snippets)
+
+
+def _guess_rust_crate_root(source_root: Path, filepath: Path) -> Path:
+    """Guess the crate root directory for a Rust source file."""
+    for parent in [filepath.parent, *filepath.parents]:
+        if parent == source_root.parent:
+            break
+        if (parent / "Cargo.toml").exists():
+            src_dir = parent / "src"
+            return src_dir if src_dir.is_dir() else parent
+    src_dir = source_root / "src"
+    return src_dir if src_dir.is_dir() else source_root
+
+
+def _rust_mod_candidates(base_dir: Path, name: str) -> List[Path]:
+    """Return candidate file paths for a Rust mod declaration."""
+    return [base_dir / f"{name}.rs", base_dir / name / "mod.rs"]
+
+
+def _rust_use_candidates(spec: str, filepath: Path, crate_root: Path) -> List[Path]:
+    """Return candidate module files for a Rust use path."""
+    spec = spec.strip()
+    spec = re.sub(r'\s+as\s+\w+$', "", spec)
+    spec = spec.replace("::{self", "").replace(", self}", "")
+    head = spec.split("::")
+    if not head:
+        return []
+
+    if head[0] == "crate":
+        parts = [part for part in head[1:] if part and part != "self"]
+        return _rust_module_chain_candidates(crate_root, parts)
+    if head[0] == "super":
+        up = 0
+        while up < len(head) and head[up] == "super":
+            up += 1
+        base = filepath.parent
+        for _ in range(up):
+            base = base.parent
+        parts = [part for part in head[up:] if part and part != "self"]
+        return _rust_module_chain_candidates(base, parts)
+    if head[0] == "self":
+        parts = [part for part in head[1:] if part and part != "self"]
+        return _rust_module_chain_candidates(filepath.parent, parts)
+    return []
+
+
+def _rust_module_chain_candidates(base: Path, parts: List[str]) -> List[Path]:
+    """Resolve a Rust module chain to possible source files."""
+    if not parts:
+        return []
+    current = base
+    candidates = []
+    for idx, part in enumerate(parts):
+        file_candidate = current / f"{part}.rs"
+        mod_candidate = current / part / "mod.rs"
+        if idx == len(parts) - 1:
+            candidates.extend([file_candidate, mod_candidate])
+        elif mod_candidate.exists():
+            current = mod_candidate.parent
+        elif file_candidate.exists():
+            current = file_candidate.parent
+        else:
+            current = current / part
+    return candidates
+
+
+def _extract_rust_declarations(content: str) -> str:
+    """Extract declarations from Rust source."""
+    lines = content.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r'^(pub\s+)?(async\s+)?fn\s+\w+', stripped):
+            result.append(stripped)
+            continue
+        if re.match(r'^(pub\s+)?(struct|enum|trait|type|mod)\s+\w+', stripped):
+            result.append(stripped)
+            continue
+        if re.match(r'^impl(?:<[^>]+>)?\s+', stripped):
+            result.append(stripped)
+            continue
+    return "\n".join(result)
+
+
 def _resolve_bash_sources(code: str, source_dir: str, filepath: Path) -> str:
     """Resolve source/. commands for bash files."""
     sources = re.findall(r'(?:source|\.) ["\'"]?([^\s"\']+)', code)
@@ -609,6 +934,19 @@ def _resolve_bash_sources(code: str, source_dir: str, filepath: Path) -> str:
     return "\n".join(snippets)
 
 
+def _dedupe_paths(paths: List[Path]) -> List[Path]:
+    """Preserve order while deduplicating candidate paths."""
+    result = []
+    seen = set()
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
 def resolve_includes(code: str, source_dir: str, filepath: Path,
                      profile_name: str) -> str:
     """Resolve local includes/imports and return declaration context.
@@ -620,6 +958,10 @@ def resolve_includes(code: str, source_dir: str, filepath: Path,
         "c_cpp": _resolve_c_includes,
         "python": _resolve_python_imports,
         "bash": _resolve_bash_sources,
+        "node": _resolve_node_imports,
+        "ruby": _resolve_ruby_requires,
+        "perl": _resolve_perl_imports,
+        "rust": _resolve_rust_modules,
     }
     resolver = resolvers.get(profile_name)
     if not resolver:

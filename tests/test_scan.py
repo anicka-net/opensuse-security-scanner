@@ -708,6 +708,50 @@ def test_resolve_c_includes_empty_for_system_only(tmp_path):
     assert result == ""
 
 
+def test_resolve_c_includes_preserves_nested_include_paths(tmp_path):
+    """Nested quoted includes should resolve the matching project path."""
+    (tmp_path / "include" / "foo").mkdir(parents=True)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "include" / "foo" / "bar.h").write_text(
+        "int nested_target(void);\n"
+    )
+    (tmp_path / "src" / "main.cpp").write_text(
+        '#include "foo/bar.h"\n'
+        "int main() { return nested_target(); }\n"
+    )
+
+    code = (tmp_path / "src" / "main.cpp").read_text()
+    result = scan.resolve_includes(
+        code, str(tmp_path), tmp_path / "src" / "main.cpp", "c_cpp"
+    )
+    assert "nested_target" in result
+    assert "include/foo/bar.h" in result
+
+
+def test_resolve_c_includes_avoids_wrong_duplicate_basename(tmp_path):
+    """Path-qualified includes should not degrade to basename-only matches."""
+    (tmp_path / "include" / "foo").mkdir(parents=True)
+    (tmp_path / "vendor" / "other").mkdir(parents=True)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "include" / "foo" / "bar.h").write_text(
+        "int expected_target(void);\n"
+    )
+    (tmp_path / "vendor" / "other" / "bar.h").write_text(
+        "int wrong_target(void);\n"
+    )
+    (tmp_path / "src" / "main.cpp").write_text(
+        '#include "foo/bar.h"\n'
+        "int main() { return expected_target(); }\n"
+    )
+
+    code = (tmp_path / "src" / "main.cpp").read_text()
+    result = scan.resolve_includes(
+        code, str(tmp_path), tmp_path / "src" / "main.cpp", "c_cpp"
+    )
+    assert "expected_target" in result
+    assert "wrong_target" not in result
+
+
 def test_resolve_python_imports(tmp_path):
     """Python import resolver finds local modules."""
     (tmp_path / "utils.py").write_text(
@@ -758,11 +802,101 @@ def test_resolve_bash_sources(tmp_path):
     assert "cleanup" in result
 
 
+def test_resolve_node_imports(tmp_path):
+    """Node resolver finds local relative modules."""
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "helpers.ts").write_text(
+        "export function runCommand(cmd: string) {\n"
+        "  return cmd;\n"
+        "}\n"
+        "export class Executor {}\n"
+    )
+    (tmp_path / "main.ts").write_text(
+        'import { runCommand } from "./lib/helpers";\n'
+        "runCommand(process.argv[2]);\n"
+    )
+
+    result = scan.resolve_includes(
+        (tmp_path / "main.ts").read_text(), str(tmp_path), tmp_path / "main.ts", "node"
+    )
+    assert "runCommand" in result
+    assert "Executor" in result
+    assert "lib/helpers.ts" in result
+
+
+def test_resolve_ruby_requires(tmp_path):
+    """Ruby resolver finds local require_relative files."""
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "helpers.rb").write_text(
+        "module Helpers\n"
+        "  class Runner\n"
+        "  end\n"
+        "end\n"
+        "def perform_check\n"
+        "end\n"
+    )
+    (tmp_path / "main.rb").write_text(
+        'require_relative "lib/helpers"\n'
+        "perform_check\n"
+    )
+
+    result = scan.resolve_includes(
+        (tmp_path / "main.rb").read_text(), str(tmp_path), tmp_path / "main.rb", "ruby"
+    )
+    assert "module Helpers" in result
+    assert "class Runner" in result
+    assert "def perform_check" in result
+
+
+def test_resolve_perl_imports(tmp_path):
+    """Perl resolver finds local modules under use lib paths."""
+    (tmp_path / "lib" / "App").mkdir(parents=True)
+    (tmp_path / "lib" / "App" / "Util.pm").write_text(
+        "package App::Util;\n"
+        "sub run_command {\n"
+        "    return 1;\n"
+        "}\n"
+        "1;\n"
+    )
+    (tmp_path / "main.pl").write_text(
+        "use lib 'lib';\n"
+        "use App::Util;\n"
+    )
+
+    result = scan.resolve_includes(
+        (tmp_path / "main.pl").read_text(), str(tmp_path), tmp_path / "main.pl", "perl"
+    )
+    assert "package App::Util;" in result
+    assert "sub run_command" in result
+    assert "lib/App/Util.pm" in result
+
+
+def test_resolve_rust_modules(tmp_path):
+    """Rust resolver finds sibling modules referenced by mod declarations."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "helpers.rs").write_text(
+        "pub fn run_command() {}\n"
+        "pub struct Executor;\n"
+    )
+    (tmp_path / "src" / "main.rs").write_text(
+        "mod helpers;\n"
+        "use crate::helpers::run_command;\n"
+        "fn main() { run_command(); }\n"
+    )
+
+    result = scan.resolve_includes(
+        (tmp_path / "src" / "main.rs").read_text(), str(tmp_path), tmp_path / "src" / "main.rs", "rust"
+    )
+    assert "pub fn run_command" in result
+    assert "pub struct Executor" in result
+    assert "src/helpers.rs" in result
+
+
 def test_resolve_unknown_profile(tmp_path):
     """Unknown profiles return empty string."""
-    (tmp_path / "test.rs").write_text('fn main() {}')
+    (tmp_path / "test.go").write_text('package main\nfunc main() {}\n')
     result = scan.resolve_includes(
-        "fn main() {}", str(tmp_path), tmp_path / "test.rs", "rust"
+        "package main\nfunc main() {}\n", str(tmp_path), tmp_path / "test.go", "go"
     )
     assert result == ""
 
