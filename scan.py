@@ -52,7 +52,7 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -123,7 +123,7 @@ class SourceFile:
 class Backend:
     """Base class for model backends."""
 
-    def query(self, system: str, user: str, max_tokens: int = 4096) -> str:
+    def query(self, system: str, user: str, max_tokens: int = 16384) -> str:
         raise NotImplementedError
 
 
@@ -134,7 +134,7 @@ class OllamaBackend(Backend):
         self.model = model
         self.base_url = base_url.rstrip("/")
 
-    def query(self, system: str, user: str, max_tokens: int = 4096) -> str:
+    def query(self, system: str, user: str, max_tokens: int = 16384) -> str:
         try:
             resp = requests.post(
                 f"{self.base_url}/api/chat",
@@ -167,7 +167,7 @@ class OpenAIBackend(Backend):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
 
-    def query(self, system: str, user: str, max_tokens: int = 4096) -> str:
+    def query(self, system: str, user: str, max_tokens: int = 16384) -> str:
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -211,7 +211,7 @@ class ClaudeBackend(Backend):
             "haiku": "claude-haiku-4-5-20251001",
         }
 
-    def query(self, system: str, user: str, max_tokens: int = 4096) -> str:
+    def query(self, system: str, user: str, max_tokens: int = 16384) -> str:
         model_id = self._model_map.get(self.model, self.model)
         prompt = f"{system}\n\n{user}"
         try:
@@ -244,7 +244,7 @@ class GeminiBackend(Backend):
             "pro": "gemini-2.5-pro",
         }
 
-    def query(self, system: str, user: str, max_tokens: int = 4096) -> str:
+    def query(self, system: str, user: str, max_tokens: int = 16384) -> str:
         model_id = self._model_map.get(self.model, self.model)
         prompt = f"{system}\n\n{user}"
         try:
@@ -280,7 +280,7 @@ class CodexBackend(Backend):
         # Default model is whatever codex defaults to (usually o4-mini)
         self.model = model
 
-    def query(self, system: str, user: str, max_tokens: int = 4096) -> str:
+    def query(self, system: str, user: str, max_tokens: int = 16384) -> str:
         prompt = f"{system}\n\n{user}"
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             outpath = f.name
@@ -418,7 +418,7 @@ def find_source_files(source_dir: str, profiles: List[Profile]) -> List[SourceFi
     return files
 
 
-def chunk_file(code: str, max_chars: int = 20000) -> List[str]:
+def chunk_file(code: str, max_chars: int = 40000) -> List[str]:
     """Split code into chunks that fit model context."""
     if len(code) <= max_chars:
         return [code]
@@ -436,6 +436,198 @@ def chunk_file(code: str, max_chars: int = 20000) -> List[str]:
     if current:
         chunks.append("\n".join(current))
     return chunks
+
+
+# ── Include / import resolution ────────────────────────────────────────
+
+# Maximum total chars of resolved header context to prepend.
+HEADER_BUDGET = 8000
+
+
+def _resolve_c_includes(code: str, source_dir: str, filepath: Path) -> str:
+    """Resolve local #include "..." directives for C/C++ files.
+
+    Returns function/class/struct declarations from found headers,
+    capped to HEADER_BUDGET chars.
+    """
+    includes = re.findall(r'#include\s+"([^"]+)"', code)
+    if not includes:
+        return ""
+
+    base_dir = filepath.parent
+    snippets = []
+    seen = set()
+    budget = HEADER_BUDGET
+
+    for inc in includes:
+        if inc in seen:
+            continue
+        seen.add(inc)
+
+        # Search relative to file, then in source tree
+        candidates = [base_dir / inc]
+        candidates.extend(Path(source_dir).rglob(Path(inc).name))
+
+        for candidate in candidates:
+            if candidate.is_file():
+                try:
+                    header = candidate.read_text(errors="replace")
+                except OSError:
+                    continue
+                # Extract declarations: function signatures, class/struct/enum
+                # definitions, typedefs, #define macros for key constants
+                decls = _extract_c_declarations(header)
+                if decls:
+                    rel = str(candidate.relative_to(source_dir)) if str(candidate).startswith(source_dir) else str(candidate)
+                    snippet = f"// --- {rel} (declarations) ---\n{decls}"
+                    if len(snippet) <= budget:
+                        snippets.append(snippet)
+                        budget -= len(snippet)
+                break
+    return "\n".join(snippets)
+
+
+def _extract_c_declarations(header: str) -> str:
+    """Extract function declarations, class/struct definitions from C/C++ header."""
+    lines = header.split("\n")
+    result = []
+    in_block = False
+    brace_depth = 0
+
+    for line in lines:
+        stripped = line.strip()
+        # Skip comments and preprocessor guards
+        if stripped.startswith("//") or stripped.startswith("/*"):
+            continue
+        if stripped.startswith("#ifndef") or stripped.startswith("#define") or stripped.startswith("#endif"):
+            continue
+        if stripped.startswith("#pragma"):
+            continue
+        # Include relevant #define macros (not guards)
+        if stripped.startswith("#define") and "(" in stripped:
+            result.append(stripped)
+            continue
+        # Function declarations (ending with ;)
+        if re.match(r'^\s*(static\s+|inline\s+|extern\s+|virtual\s+)*([\w:*&<>,\s]+)\s+\w+\s*\(', stripped):
+            if stripped.endswith(";"):
+                result.append(stripped)
+                continue
+            # Multi-line declaration — take until ;
+            if ";" not in stripped and "{" not in stripped:
+                result.append(stripped)
+                continue
+        # Class/struct/enum declarations
+        if re.match(r'^\s*(class|struct|enum|typedef|using|namespace)\s', stripped):
+            result.append(stripped)
+            continue
+
+    return "\n".join(result)
+
+
+def _resolve_python_imports(code: str, source_dir: str, filepath: Path) -> str:
+    """Resolve local imports for Python files."""
+    imports = re.findall(r'(?:from\s+(\S+)\s+import|import\s+(\S+))', code)
+    if not imports:
+        return ""
+
+    snippets = []
+    seen = set()
+    budget = HEADER_BUDGET
+
+    for frm, imp in imports:
+        mod = frm or imp
+        if mod in seen or mod.startswith(("os", "sys", "re", "json", "typing",
+                                          "pathlib", "collections", "functools",
+                                          "subprocess", "datetime", "hashlib",
+                                          "urllib", "http", "socket", "logging")):
+            continue
+        seen.add(mod)
+
+        # Convert module path to file path
+        mod_path = mod.replace(".", "/")
+        candidates = list(Path(source_dir).rglob(f"{mod_path}.py"))
+        candidates.extend(Path(source_dir).rglob(f"{mod_path}/__init__.py"))
+
+        for candidate in candidates:
+            if candidate.is_file():
+                try:
+                    content = candidate.read_text(errors="replace")
+                except OSError:
+                    continue
+                # Extract function/class definitions
+                decls = _extract_python_declarations(content)
+                if decls:
+                    rel = str(candidate.relative_to(source_dir))
+                    snippet = f"# --- {rel} (declarations) ---\n{decls}"
+                    if len(snippet) <= budget:
+                        snippets.append(snippet)
+                        budget -= len(snippet)
+                break
+
+    return "\n".join(snippets)
+
+
+def _extract_python_declarations(content: str) -> str:
+    """Extract function and class signatures from Python source."""
+    lines = content.split("\n")
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r'^(def|class|async\s+def)\s+\w+', stripped):
+            result.append(stripped)
+    return "\n".join(result)
+
+
+def _resolve_bash_sources(code: str, source_dir: str, filepath: Path) -> str:
+    """Resolve source/. commands for bash files."""
+    sources = re.findall(r'(?:source|\.) ["\'"]?([^\s"\']+)', code)
+    if not sources:
+        return ""
+
+    snippets = []
+    budget = HEADER_BUDGET
+
+    for src in sources:
+        name = Path(src).name
+        candidates = list(Path(source_dir).rglob(name))
+        for candidate in candidates:
+            if candidate.is_file():
+                try:
+                    content = candidate.read_text(errors="replace")
+                except OSError:
+                    continue
+                # Extract function definitions
+                funcs = re.findall(r'^(\w+\s*\(\)\s*\{)', content, re.MULTILINE)
+                if funcs:
+                    rel = str(candidate.relative_to(source_dir))
+                    snippet = f"# --- {rel} (functions) ---\n" + "\n".join(funcs)
+                    if len(snippet) <= budget:
+                        snippets.append(snippet)
+                        budget -= len(snippet)
+                break
+
+    return "\n".join(snippets)
+
+
+def resolve_includes(code: str, source_dir: str, filepath: Path,
+                     profile_name: str) -> str:
+    """Resolve local includes/imports and return declaration context.
+
+    Returns a string of resolved declarations to prepend to the source,
+    or empty string if nothing found.
+    """
+    resolvers = {
+        "c_cpp": _resolve_c_includes,
+        "python": _resolve_python_imports,
+        "bash": _resolve_bash_sources,
+    }
+    resolver = resolvers.get(profile_name)
+    if not resolver:
+        return ""
+    result = resolver(code, source_dir, filepath)
+    if result:
+        return f"\n// === Resolved local declarations (from project headers/imports) ===\n{result}\n// === End resolved declarations ===\n\n"
+    return ""
 
 
 def utc_now() -> str:
@@ -703,8 +895,14 @@ def checkout_obs_package(project_package: str, work_dir: str) -> str:
 # ── Pipeline stages ─────────────────────────────────────────────────────
 
 def run_scan_stage(files: List[SourceFile], backend: Backend,
-                   stage_name: str, source_dir: str, session_dir: Path):
-    """Run a scanning stage over files and persist all outputs."""
+                   stage_name: str, source_dir: str, session_dir: Path,
+                   triage_hints: Optional[Dict[str, List]] = None):
+    """Run a scanning stage over files and persist all outputs.
+
+    triage_hints: when running reasoning stage, optionally maps relpath
+    to list of triage findings for that file.  Appended as focus hints
+    so the reasoning model knows where triage flagged issues.
+    """
     for i, source_file in enumerate(files):
         filepath = source_file.path
         profile = source_file.profile
@@ -715,6 +913,12 @@ def run_scan_stage(files: List[SourceFile], backend: Backend,
             continue
 
         code = filepath.read_text(errors="replace")
+
+        # Prepend resolved local declarations from headers/imports
+        header_ctx = resolve_includes(code, source_dir, filepath, profile.name)
+        if header_ctx:
+            code = header_ctx + code
+
         chunks = chunk_file(code)
 
         print(
@@ -722,15 +926,40 @@ def run_scan_stage(files: List[SourceFile], backend: Backend,
             flush=True,
         )
 
+        # Build triage hint suffix for reasoning stage
+        hint_suffix = ""
+        if triage_hints and relpath in triage_hints:
+            hints = triage_hints[relpath]
+            hint_lines = []
+            for h in hints:
+                loc = h.location if hasattr(h, 'location') else h.get('location', '?')
+                typ = h.type if hasattr(h, 'type') else h.get('type', '?')
+                hint_lines.append(f"  - {loc}: {typ}")
+            hint_suffix = (
+                "\n\nNOTE: A separate triage scanner flagged these areas "
+                "in this file — use this as focus guidance, but do your "
+                "own independent analysis:\n" + "\n".join(hint_lines)
+            )
+
         chunk_records = []
         for ci, chunk in enumerate(chunks):
             label = relpath
             if len(chunks) > 1:
                 label = f"{relpath} (part {ci+1}/{len(chunks)})"
-            user_msg = f"SOURCE FILE: {label}\n```\n{chunk}\n```"
+            user_msg = f"SOURCE FILE: {label}\n```\n{chunk}\n```{hint_suffix}"
 
             system_prompt = profile.triage_prompt if stage_name == "triage" else profile.reasoning_prompt
             raw = backend.query(system_prompt, user_msg)
+
+            # Retry once on empty response — models sometimes silently
+            # return empty when near context limits
+            if not raw or not raw.strip():
+                print(f"    [WARN] Empty response, retrying...", flush=True)
+                raw = backend.query(system_prompt, user_msg)
+                if not raw or not raw.strip():
+                    raw = "[ERROR: empty response from model after retry]"
+                    print(f"    [ERROR] Empty response persists for {label}", flush=True)
+
             findings = parse_findings(raw, relpath, repr(backend), stage_name)
             chunk_records.append({
                 "chunk_index": ci + 1,
@@ -936,8 +1165,15 @@ def run_pipeline(args) -> ScanResult:
     print(f"{'='*60}", flush=True)
 
     flagged_paths = [f for f in files if str(f.path.relative_to(source_dir)) in flagged_files]
+
+    # Build triage hints: map each flagged file to its triage findings
+    triage_hints = {}
+    for f in triage_findings:
+        triage_hints.setdefault(f.file, []).append(f)
+
     run_scan_stage(
-        flagged_paths, reasoning_backend, "reasoning", source_dir, session_dir
+        flagged_paths, reasoning_backend, "reasoning", source_dir, session_dir,
+        triage_hints=triage_hints,
     )
     reasoning_findings = load_stage_findings(session_dir, "reasoning")
 

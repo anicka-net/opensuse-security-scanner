@@ -16,7 +16,7 @@ class FakeBackend(scan.Backend):
         )
         self.seen_files = []
 
-    def query(self, system: str, user: str, max_tokens: int = 4096) -> str:
+    def query(self, system: str, user: str, max_tokens: int = 16384) -> str:
         if user.startswith("SOURCE FILE: "):
             label = user.splitlines()[0].removeprefix("SOURCE FILE: ")
             filename = label.split(" (part ", 1)[0]
@@ -623,3 +623,120 @@ def test_main_rejects_unknown_config_keys(tmp_path):
 
     assert result.returncode != 0
     assert "Unknown config key(s): totally_wrong" in result.stderr
+
+
+# ── Include / import resolution tests ──────────────────────────────────
+
+
+def test_resolve_c_includes(tmp_path):
+    """C include resolver finds local headers and extracts declarations."""
+    # Create a mini C project
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "Util.hpp").write_text(
+        '#pragma once\n'
+        '#include <string>\n'
+        'class Util {\n'
+        '    static std::string exec(const std::string cmd);\n'
+        '    static int run(char* argv[]);\n'
+        '};\n'
+    )
+    (tmp_path / "lib" / "main.cpp").write_text(
+        '#include "Util.hpp"\n'
+        '#include <stdio.h>\n'
+        'int main() { Util::exec("ls"); }\n'
+    )
+
+    code = (tmp_path / "lib" / "main.cpp").read_text()
+    result = scan.resolve_includes(
+        code, str(tmp_path), tmp_path / "lib" / "main.cpp", "c_cpp"
+    )
+    assert "exec" in result
+    assert "Util.hpp" in result
+    # System headers should NOT be resolved
+    assert "stdio.h" not in result
+
+
+def test_resolve_c_includes_empty_for_system_only(tmp_path):
+    """No context returned when only system includes present."""
+    (tmp_path / "test.c").write_text('#include <stdlib.h>\nint main() {}\n')
+    result = scan.resolve_includes(
+        (tmp_path / "test.c").read_text(), str(tmp_path),
+        tmp_path / "test.c", "c_cpp"
+    )
+    assert result == ""
+
+
+def test_resolve_python_imports(tmp_path):
+    """Python import resolver finds local modules."""
+    (tmp_path / "utils.py").write_text(
+        'def run_command(cmd):\n'
+        '    pass\n\n'
+        'class Executor:\n'
+        '    def execute(self):\n'
+        '        pass\n'
+    )
+    (tmp_path / "main.py").write_text(
+        'import os\n'
+        'from utils import run_command\n'
+        'run_command("ls")\n'
+    )
+
+    code = (tmp_path / "main.py").read_text()
+    result = scan.resolve_includes(
+        code, str(tmp_path), tmp_path / "main.py", "python"
+    )
+    assert "run_command" in result
+    assert "Executor" in result
+    # stdlib should not be resolved
+    assert "os" not in result or "utils" in result
+
+
+def test_resolve_bash_sources(tmp_path):
+    """Bash source resolver finds sourced scripts and extracts functions."""
+    (tmp_path / "helpers.sh").write_text(
+        '#!/bin/bash\n'
+        'do_backup() {\n'
+        '    tar cf /tmp/backup.tar /data\n'
+        '}\n'
+        'cleanup() {\n'
+        '    rm -rf /tmp/work\n'
+        '}\n'
+    )
+    (tmp_path / "main.sh").write_text(
+        '#!/bin/bash\n'
+        'source helpers.sh\n'
+        'do_backup\n'
+    )
+
+    code = (tmp_path / "main.sh").read_text()
+    result = scan.resolve_includes(
+        code, str(tmp_path), tmp_path / "main.sh", "bash"
+    )
+    assert "do_backup" in result
+    assert "cleanup" in result
+
+
+def test_resolve_unknown_profile(tmp_path):
+    """Unknown profiles return empty string."""
+    (tmp_path / "test.rs").write_text('fn main() {}')
+    result = scan.resolve_includes(
+        "fn main() {}", str(tmp_path), tmp_path / "test.rs", "rust"
+    )
+    assert result == ""
+
+
+def test_resolve_header_budget_cap(tmp_path):
+    """Resolved context respects the HEADER_BUDGET limit."""
+    (tmp_path / "lib").mkdir()
+    # Create a large header that would exceed budget
+    big_header = "class Big {\n" + "    void method_%d();\n" * 2000 + "};\n"
+    big_header = big_header % tuple(range(2000))
+    (tmp_path / "lib" / "big.h").write_text(big_header)
+    (tmp_path / "lib" / "main.cpp").write_text('#include "big.h"\nint main() {}\n')
+
+    code = (tmp_path / "lib" / "main.cpp").read_text()
+    result = scan.resolve_includes(
+        code, str(tmp_path), tmp_path / "lib" / "main.cpp", "c_cpp"
+    )
+    # Result should be within budget + wrapper text
+    assert len(result) <= scan.HEADER_BUDGET + 200
