@@ -215,10 +215,12 @@ class ClaudeBackend(Backend):
         model_id = self._model_map.get(self.model, self.model)
         prompt = f"{system}\n\n{user}"
         try:
-            # Pipe prompt via stdin to avoid CLI arg length limits
+            # Pass prompt via -p flag directly.  Python subprocess
+            # uses execve which supports the full OS ARG_MAX (~2MB).
+            # Note: --bare requires API auth; omit it for subscription.
             result = subprocess.run(
-                ["claude", "--print", "--model", model_id, "--bare"],
-                input=prompt,
+                ["claude", "--print", "--model", model_id,
+                 "-p", prompt],
                 capture_output=True, text=True, timeout=300,
             )
             if result.returncode == 0:
