@@ -60,8 +60,8 @@ large packages can be slow and expensive.
 
 ## Recommended setup
 
-Based on testing against packages with known vulnerabilities
-(open-iscsi DHCPv6 strlen bug, transactional-update popen injection):
+Based on testing against openSUSE packages with a mix of real
+and false-positive findings:
 
 | Stage | Model | Why | VRAM |
 |-------|-------|-----|------|
@@ -204,17 +204,16 @@ These notes are early directional observations from local testing, not a
 benchmark suite and not a publishable claim set. Treat them as operator
 guidance only.
 
-Tested on open-iscsi (confirmed strlen vulnerability) and
-transactional-update (confirmed popen injection). Same prompt,
-same files:
+Tested on openSUSE packages containing both subtle and obvious
+vulnerability patterns. Same prompt, same files across all models:
 
-| Model | dhcpv6 strlen (subtle) | popen injection (obvious) | FP noise |
-|-------|------------------------|--------------------------|----------|
+| Model | Subtle chain bugs | Obvious pattern bugs | FP noise |
+|-------|-------------------|---------------------|----------|
 | GPT-OSS 20B (3.6B active) | Found | Found | Low |
 | Gemma 4 31B | Strong — traced full chain | Found + novel extras | Medium |
 | GPT-OSS 120B (5.1B active) | Found | Found | Medium |
 | Qwen3 32B | Partial — missed root cause | Found | Medium |
-| Devstral Small 2 24B | Partial — wrong root cause | Found | **Very high** (100 FP on 4 clean files) |
+| Devstral Small 2 24B | Partial — wrong root cause | Found | Very high |
 
 ## Requirements
 
