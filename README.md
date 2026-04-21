@@ -1,9 +1,11 @@
 # openSUSE Security Scanner
 
-Multi-model vulnerability scanning pipeline for C/C++ packages.
-Three independent stages — triage, reasoning, verdict — each
-backed by any LLM you choose: local models via ollama/llama.cpp,
-or frontier APIs via Claude, Gemini, or Codex CLIs.
+Multi-model vulnerability scanning pipeline for software packages.
+Supports C/C++, Python, Ruby, Bash, Rust, Perl, and Node.js via
+language-specific profiles. Three independent stages — triage,
+reasoning, verdict — each backed by any LLM you choose: local
+models via ollama/llama.cpp, or frontier APIs via Claude, Gemini,
+or Codex CLIs.
 
 This tool is designed for analyst assistance, not autonomous security
 sign-off. A "clean" report means "nothing survived this pipeline under

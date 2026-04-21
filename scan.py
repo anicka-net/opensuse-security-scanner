@@ -883,7 +883,7 @@ def run_pipeline(args) -> ScanResult:
 
     files = find_source_files(source_dir, profiles)
     if not files:
-        print(f"No C/C++ source files found in {source_dir}", flush=True)
+        print(f"No matching source files found in {source_dir}", flush=True)
         return result
 
     result.files_scanned = len(files)
@@ -1026,7 +1026,7 @@ def generate_report(result: ScanResult, output_path: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Multi-model security scanner for C/C++ packages",
+        description="Multi-model security scanner for software packages",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Backend spec format: backend/model[@url]
