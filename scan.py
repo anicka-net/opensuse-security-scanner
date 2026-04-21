@@ -284,8 +284,8 @@ class CodexBackend(Backend):
     """
 
     def __init__(self, model: str = ""):
-        # Default model is whatever codex defaults to (usually o4-mini)
-        self.model = model
+        # "default" means use whatever codex defaults to (empty = no -m flag)
+        self.model = "" if model == "default" else model
 
     def query(self, system: str, user: str, max_tokens: int = 16384) -> str:
         prompt = f"{system}\n\n{user}"
