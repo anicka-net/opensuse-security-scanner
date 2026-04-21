@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from argparse import Namespace
 from pathlib import Path
 
@@ -554,3 +556,70 @@ def test_report_includes_stage_summary(tmp_path):
     text = output.read_text()
     assert "## Stage Summary" in text
     assert "- triage: 2 completed, 1 with findings, 2 total findings" in text
+
+
+def test_main_loads_config_file(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "tool.py").write_text("print('hi')\n")
+    (tmp_path / "config.toml").write_text(
+        'source_dir = "src"\n'
+        'triage_only = true\n'
+        'profile = "python"\n'
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(Path(scan.__file__).resolve())],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0
+    assert "Found 1 source files in src" in result.stdout
+    assert "[python]" in result.stdout
+
+
+def test_cli_overrides_config_file(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.c").write_text("int main(void) { return 0; }\n")
+    (tmp_path / "config.toml").write_text(
+        'source_dir = "src"\n'
+        'triage_only = true\n'
+        'profile = "python"\n'
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(Path(scan.__file__).resolve()), "--profile", "c_cpp"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0
+    assert "Found 1 source files in src" in result.stdout
+    assert "[c_cpp]" in result.stdout
+
+
+def test_main_rejects_unknown_config_keys(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "tool.py").write_text("print('hi')\n")
+    (tmp_path / "config.toml").write_text(
+        'source_dir = "src"\n'
+        'totally_wrong = true\n'
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(Path(scan.__file__).resolve())],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "Unknown config key(s): totally_wrong" in result.stderr

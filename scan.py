@@ -54,6 +54,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+
 import requests
 
 
@@ -256,7 +261,7 @@ class GeminiBackend(Backend):
                 return output
             return f"[ERROR: gemini exit {result.returncode}: {result.stderr[:200]}]"
         except FileNotFoundError:
-            return "[ERROR: gemini CLI not found — install with: npm install -g @anthropic-ai/gemini-cli... wait no: npm install -g @anthropic-ai/gemini-cli is wrong. Check https://github.com/google-gemini/gemini-cli]"
+            return "[ERROR: gemini CLI not found — install with: npm install -g @google/gemini-cli]"
         except subprocess.TimeoutExpired:
             return "[ERROR: gemini timeout]"
 
@@ -390,7 +395,7 @@ def parse_backend_spec(spec: str) -> Backend:
 
 # ── File handling ───────────────────────────────────────────────────────
 
-DEFAULT_SKIP_DIRS = {"test", "tests", "testing", "t", "testdata"}
+DEFAULT_SKIP_DIRS = ("test", "tests", "testing", "t", "testdata")
 
 
 def find_source_files(source_dir: str, profiles: List[Profile]) -> List[SourceFile]:
@@ -404,7 +409,8 @@ def find_source_files(source_dir: str, profiles: List[Profile]) -> List[SourceFi
     for p in Path(source_dir).rglob("*"):
         profile = extension_map.get(p.suffix.lower())
         if profile and p.is_file():
-            parts = p.parts
+            # Make the check case-insensitive
+            parts = [part.lower() for part in p.parts]
             if any(t in parts for t in DEFAULT_SKIP_DIRS):
                 continue
             files.append(SourceFile(path=p, profile=profile))
@@ -1024,7 +1030,53 @@ def generate_report(result: ScanResult, output_path: str):
 
 # ── CLI ─────────────────────────────────────────────────────────────────
 
+CONFIG_KEYS = {
+    "source_dir",
+    "obs_package",
+    "resume_session",
+    "package_name",
+    "output",
+    "json",
+    "scratch_dir",
+    "profile",
+    "triage",
+    "reasoning",
+    "verdict",
+    "triage_only",
+}
+
+
+def load_config_file(path: Path) -> dict:
+    """Load and validate TOML config."""
+    with path.open("rb") as f:
+        config = tomllib.load(f)
+
+    if not isinstance(config, dict):
+        raise ValueError("Config root must be a TOML table.")
+
+    unknown = sorted(set(config) - CONFIG_KEYS)
+    if unknown:
+        raise ValueError(
+            "Unknown config key(s): " + ", ".join(unknown) +
+            ". Supported keys: " + ", ".join(sorted(CONFIG_KEYS))
+        )
+
+    return config
+
 def main():
+    # Load config file if present
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", default="config.toml",
+                               help="Path to TOML configuration file.")
+    config_args, _ = config_parser.parse_known_args()
+
+    config = {}
+    if Path(config_args.config).exists():
+        try:
+            config = load_config_file(Path(config_args.config))
+        except ValueError as e:
+            config_parser.error(str(e))
+
     parser = argparse.ArgumentParser(
         description="Multi-model security scanner for software packages",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1038,9 +1090,10 @@ Backend spec format: backend/model[@url]
   gemini/flash                        Google Gemini (flash, pro)
   codex/o3-mini                       OpenAI API (any model name)
 """,
+        parents=[config_parser],
     )
 
-    source = parser.add_mutually_exclusive_group(required=True)
+    source = parser.add_mutually_exclusive_group(required=False)
     source.add_argument("--source-dir", help="Path to extracted package source")
     source.add_argument("--obs-package",
                         help="OBS project/package (e.g. openSUSE:Factory/zypper)")
@@ -1068,7 +1121,12 @@ Backend spec format: backend/model[@url]
     parser.add_argument("--triage-only", action="store_true",
                         help="Run only the triage stage")
 
+    parser.set_defaults(**config)
     args = parser.parse_args()
+
+    if not any([args.source_dir, args.obs_package, args.resume_session]):
+        parser.error("A source must be provided via --source-dir, --obs-package, or --resume-session, or in the config file.")
+
     result = run_pipeline(args)
 
     generate_report(result, args.output)

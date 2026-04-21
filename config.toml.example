@@ -1,0 +1,25 @@
+# Example configuration for opensuse-security-scanner.
+# Settings in this file can be overridden by command-line arguments.
+
+# --- General Settings ---
+# package_name = "my-package"
+# output = "report.md"
+# json = "report.json"
+# scratch_dir = "/tmp/opensuse-security-scanner"
+# profile = "auto" # or "c_cpp,python"
+
+# --- Source Settings (choose one) ---
+# source_dir = "/path/to/extracted/source"
+# obs_package = "openSUSE:Factory/zypper"
+# resume_session = "/path/to/session/dir"
+
+# --- Stage Configuration ---
+# You can specify the backend for each stage.
+# Format: "backend/model[@url]"
+#
+# triage = "ollama/gpt-oss-20b"
+# reasoning = "ollama/gemma4:31b"
+# verdict = "claude/opus"
+
+# --- Stage Toggles ---
+# triage_only = false

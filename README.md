@@ -66,6 +66,17 @@ python3 scan.py --source-dir ./src --triage-only
 python3 scan.py --source-dir ./src --profile c_cpp,python,bash
 ```
 
+## Configuration
+
+For complex or repeated scans, you can use a `config.toml` file to set your
+default options. The scanner will automatically load `config.toml` from the
+current directory if it exists. You can also specify a path to a different
+config file with `python3 scan.py --config /path/to/your/config.toml`.
+
+An example is provided in `config.toml.example`.
+
+Command-line arguments always override settings from the configuration file.
+
 For regular use, prefer local models for triage and reasoning and reserve
 frontier models for verdict or high-value packages. A full frontier run on
 large packages can be slow and expensive.
@@ -256,7 +267,7 @@ vulnerability patterns. Same prompt, same files across all models:
 ## Requirements
 
 - Python 3.8+
-- `requests` (`pip install requests`)
+- `pip install -r requirements.txt`
 - `osc` (for `--obs-package` mode)
 - At least one backend: ollama, a llama.cpp server, or a CLI
   (claude/gemini/codex)
