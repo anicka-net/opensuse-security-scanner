@@ -80,17 +80,49 @@ def test_stage_output_round_trip(tmp_path):
     assert session_id
 
 
+def test_load_profiles_supports_multiple_names():
+    profiles = scan.load_profiles("c_cpp,python,bash")
+    assert [p.name for p in profiles] == ["c_cpp", "python", "bash"]
+    assert ".c" in profiles[0].extensions
+    assert ".py" in profiles[1].extensions
+    assert ".sh" in profiles[2].extensions
+
+
+def test_load_profiles_auto_expands_to_available_profiles():
+    profiles = scan.load_profiles("auto")
+    names = {p.name for p in profiles}
+    assert "c_cpp" in names
+    assert "python" in names
+    assert "bash" in names
+
+
+def test_find_source_files_dispatches_by_extension(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.c").write_text("int main(void) { return 0; }\n")
+    (src / "tool.py").write_text("print('hi')\n")
+    (src / "script.sh").write_text("#!/bin/sh\necho hi\n")
+    (src / "README.txt").write_text("ignore me\n")
+
+    files = scan.find_source_files(str(src), scan.load_profiles("c_cpp,python,bash"))
+    dispatch = {f.path.name: f.profile.name for f in files}
+    assert dispatch["main.c"] == "c_cpp"
+    assert dispatch["tool.py"] == "python"
+    assert dispatch["script.sh"] == "bash"
+    assert "README.txt" not in dispatch
+
+
 def test_run_pipeline_writes_session_metadata_and_stage_outputs(tmp_path, monkeypatch):
     source_dir = tmp_path / "src"
     source_dir.mkdir()
     (source_dir / "vuln.c").write_text("int main(void) { return 0; }\n")
-    (source_dir / "clean.c").write_text("int ok(void) { return 0; }\n")
+    (source_dir / "clean.py").write_text("print('ok')\n")
 
     triage = FakeBackend(
         "gemini/flash",
         file_responses={
             "vuln.c": make_finding_text("main()", "overflow", "triage hit"),
-            "clean.c": "CLEAN",
+            "clean.py": "CLEAN",
         },
     )
     reasoning = FakeBackend(
@@ -115,6 +147,7 @@ def test_run_pipeline_writes_session_metadata_and_stage_outputs(tmp_path, monkey
         output=str(tmp_path / "report.md"),
         json=str(tmp_path / "report.json"),
         scratch_dir=str(tmp_path / "scratch"),
+        profile="c_cpp,python",
         triage="gemini/flash",
         reasoning="claude/sonnet",
         verdict="codex/gpt-5.4",
@@ -127,6 +160,7 @@ def test_run_pipeline_writes_session_metadata_and_stage_outputs(tmp_path, monkey
     session_dir = Path(result.session_dir)
     metadata = json.loads((session_dir / "metadata.json").read_text())
     assert metadata["package"] == "libzypp"
+    assert metadata["profiles"] == "c_cpp,python"
     assert metadata["source_dir"] == str(source_dir)
     assert metadata["backends"] == {
         "triage": "gemini/flash",
@@ -135,15 +169,15 @@ def test_run_pipeline_writes_session_metadata_and_stage_outputs(tmp_path, monkey
     }
 
     assert (session_dir / "triage" / "vuln.c.json").exists()
-    assert (session_dir / "triage" / "clean.c.json").exists()
+    assert (session_dir / "triage" / "clean.py.json").exists()
     assert (session_dir / "reasoning" / "vuln.c.json").exists()
     assert list((session_dir / "verdict").glob("*.json"))
 
-    assert triage.seen_files == ["vuln.c", "clean.c"]
+    assert triage.seen_files == ["vuln.c", "clean.py"]
     assert reasoning.seen_files == ["vuln.c"]
     assert result.files_scanned == 2
     assert result.files_with_findings == 1
-    assert result.clean_files == ["clean.c"]
+    assert result.clean_files == ["clean.py"]
     assert result.session_id
     assert len(result.findings) == 2
 
@@ -187,8 +221,9 @@ def test_triage_stage_uses_triage_prompt(tmp_path):
             return "test/capture"
 
     session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "test")
+    c_profile = scan.load_profile("c_cpp")
     scan.run_scan_stage(
-        [source_dir / "main.c"],
+        [scan.SourceFile(source_dir / "main.c", c_profile)],
         CapturingBackend(), "triage", str(source_dir), session_dir,
     )
     assert len(prompts_seen) == 1
@@ -212,13 +247,40 @@ def test_reasoning_stage_uses_reasoning_prompt(tmp_path):
             return "test/capture"
 
     session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "test")
+    c_profile = scan.load_profile("c_cpp")
     scan.run_scan_stage(
-        [source_dir / "main.c"],
+        [scan.SourceFile(source_dir / "main.c", c_profile)],
         CapturingBackend(), "reasoning", str(source_dir), session_dir,
     )
     assert len(prompts_seen) == 1
     assert "trace" in prompts_seen[0].lower() or "chain" in prompts_seen[0].lower()
     assert "quality over quantity" in prompts_seen[0].lower()
+
+
+def test_mixed_profiles_use_different_prompts(tmp_path):
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "main.c").write_text("int main() { return 0; }\n")
+    (source_dir / "tool.py").write_text("print('hi')\n")
+    (source_dir / "script.sh").write_text("#!/bin/sh\necho hi\n")
+
+    prompts_seen = {}
+
+    class CapturingBackend(scan.Backend):
+        def query(self, system, user, max_tokens=4096):
+            label = user.splitlines()[0].removeprefix("SOURCE FILE: ")
+            prompts_seen[label] = system
+            return "CLEAN"
+        def __repr__(self):
+            return "test/capture"
+
+    session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "test")
+    files = scan.find_source_files(str(source_dir), scan.load_profiles("c_cpp,python,bash"))
+    scan.run_scan_stage(files, CapturingBackend(), "triage", str(source_dir), session_dir)
+
+    assert "c/c++ code" in prompts_seen["main.c"].lower()
+    assert "python application code" in prompts_seen["tool.py"].lower()
+    assert "shell scripts" in prompts_seen["script.sh"].lower()
 
 
 # ── SOURCE/SINK parsing ───────────────────────────────────────────────
@@ -443,6 +505,7 @@ def test_resume_session_reuses_cached_stage_outputs(tmp_path, monkeypatch):
         output=str(tmp_path / "report.md"),
         json=None,
         scratch_dir=str(tmp_path / "scratch"),
+        profile="c_cpp",
         triage="gemini/flash",
         reasoning="claude/sonnet",
         verdict=None,
@@ -460,6 +523,7 @@ def test_resume_session_reuses_cached_stage_outputs(tmp_path, monkeypatch):
         output=str(tmp_path / "report2.md"),
         json=None,
         scratch_dir=str(tmp_path / "scratch"),
+        profile="c_cpp",
         triage="gemini/flash",
         reasoning="claude/sonnet",
         verdict=None,

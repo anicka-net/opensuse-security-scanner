@@ -57,124 +57,11 @@ from typing import List, Optional, Tuple
 import requests
 
 
-# ── Prompt ──────────────────────────────────────────────────────────────
+ROOT_DIR = Path(__file__).resolve().parent
+PROFILES_DIR = ROOT_DIR / "profiles"
 
-TRIAGE_PROMPT = """\
-You are a paranoid security auditor with decades of experience finding bugs in C/C++ code.
-Your job is to find REAL vulnerabilities that could be exploited by an attacker.
 
-Be suspicious. Assume the worst. If something COULD be a vulnerability, report it.
-Better to flag a false positive than miss a real bug.
-
-Focus on:
-1. Buffer overflows, heap overflows, stack overflows
-2. Command injection, shell metacharacter injection
-3. Path traversal, symlink attacks, directory escape
-4. Integer overflow/underflow leading to wrong allocations or bounds checks
-5. Format string vulnerabilities
-6. TOCTOU race conditions in file or permission checks
-7. Missing or inadequate input validation on external data (network, files, env vars, user input)
-8. Cryptographic weaknesses (weak hashing, timing attacks, verification bypasses)
-9. Privilege escalation vectors, missing privilege drops
-10. Use-after-free, double-free, null pointer dereference
-11. Missing bounds checks on array/buffer access
-12. Unsafe string operations (strcpy, strcat, sprintf without length limits)
-
-For each finding report in this exact format:
-
-FINDING:
-SEVERITY: Critical/High/Medium/Low
-LOCATION: function_name (file context)
-TYPE: vulnerability category
-DESCRIPTION: what the bug is, be specific about the code
-EXPLOITATION: concrete attack scenario
-END_FINDING
-
-If the code is genuinely clean, say exactly: CLEAN
-Do NOT report style issues, missing comments, or theoretical concerns that require impossible preconditions."""
-
-REASONING_PROMPT = """\
-You are a vulnerability researcher performing deep analysis of C/C++ code.
-Your goal is to find exploitable vulnerabilities by tracing data flow and
-reasoning about execution paths — not just pattern matching.
-
-Do NOT flag surface-level patterns. Instead, for each potential vulnerability
-you MUST trace the complete chain:
-
-1. SOURCE: Where does untrusted data enter? (network packet, file content,
-   environment variable, user input, IPC message, command-line argument)
-2. SINK: Where does it reach a dangerous operation? (memcpy, strcpy, system,
-   popen, strlen on raw buffers, array index, format string argument)
-3. PATH: What happens between source and sink? Do bounds checks actually
-   protect? Do error handlers terminate the process or fall through?
-   Does integer promotion change signedness? Can the length wrap around?
-4. CONTEXT: Who calls this function? What privilege level does the process
-   run at? Is the input actually attacker-controlled in a real deployment?
-
-Before reporting, rule out these common false positive patterns:
-- Allocators that abort on failure (g_malloc, xmalloc, solv_malloc) —
-  NULL derefs after these are unreachable
-- Error handlers that call exit(), abort(), die(), bug() — code after
-  them is dead
-- Format string functions where ALL callers pass string literals
-- Signed/unsigned comparisons where C integer promotion rules prevent
-  the negative case
-- Functions only reachable from root-owned contexts (installers, init
-  scripts, privileged daemons with no untrusted input path)
-
-Report only findings where you can describe a complete source-to-sink path
-with attacker-controlled data. Quality over quantity.
-
-For each finding report in this exact format:
-
-FINDING:
-SEVERITY: Critical/High/Medium/Low
-LOCATION: function_name (file context)
-TYPE: vulnerability category
-SOURCE: where untrusted data enters
-SINK: where the dangerous operation is
-DESCRIPTION: the complete vulnerability chain, step by step
-EXPLOITATION: concrete attack scenario with attacker prerequisites
-END_FINDING
-
-If the code is genuinely clean after this analysis, say exactly: CLEAN"""
-
-STAGE_PROMPTS = {
-    "triage": TRIAGE_PROMPT,
-    "reasoning": REASONING_PROMPT,
-}
-
-VERDICT_PROMPT_TEMPLATE = """\
-You are the final reviewer in a multi-stage security scanning pipeline
-for {filename}. Two independent scanners have already analyzed this code:
-
-**Stage 1 — Triage** (fast pattern matching, errs on the side of flagging):
-{triage_findings}
-
-**Stage 2 — Reasoning** (deep chain analysis, traces data flow source→sink):
-{reasoning_findings}
-
-{consensus_note}
-{hypothesis_note}
-
-Your job is to deliver the final verdict on each finding:
-1. Is it a REAL vulnerability or a false positive?
-2. If real, is it actually EXPLOITABLE? Check:
-   - Who controls the input? (user, network, root-only, internal)
-   - What privilege boundary is crossed? (Is there D-Bus policy, sd-bus
-     vtable enforcement, filesystem permissions, or other access control?)
-   - What is the realistic attack surface?
-3. Rate the real-world severity — not the theoretical worst case.
-
-For each finding, respond:
-VERDICT: [CONFIRMED|FALSE_POSITIVE|NEEDS_CONTEXT]
-REAL_SEVERITY: [Critical|High|Medium|Low|None]
-REASONING: [why — be specific about what makes it real or false]
-
-Source code:
-```
-{code}
-```"""
+# ── Profiles ────────────────────────────────────────────────────────────
 
 
 # ── Data types ──────────────────────────────────────────────────────────
@@ -209,6 +96,21 @@ class ScanResult:
     clean_files: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     stage_stats: dict = field(default_factory=dict)
+
+
+@dataclass
+class Profile:
+    name: str
+    extensions: List[str]
+    triage_prompt: str
+    reasoning_prompt: str
+    verdict_prompt_template: str
+
+
+@dataclass
+class SourceFile:
+    path: Path
+    profile: Profile
 
 
 # ── Backend abstraction ─────────────────────────────────────────────────
@@ -406,6 +308,46 @@ class CodexBackend(Backend):
         return f"codex/{self.model or 'default'}"
 
 
+def load_profile(name: str) -> Profile:
+    """Load a technology profile from profiles/<name>.json."""
+    path = PROFILES_DIR / f"{name}.json"
+    if not path.exists():
+        available = ", ".join(sorted(p.stem for p in PROFILES_DIR.glob("*.json")))
+        raise ValueError(f"Unknown profile {name!r}. Available: {available}")
+    payload = load_json(path)
+    return Profile(
+        name=payload["name"],
+        extensions=list(payload["extensions"]),
+        triage_prompt=payload["triage_prompt"],
+        reasoning_prompt=payload["reasoning_prompt"],
+        verdict_prompt_template=payload["verdict_prompt_template"],
+    )
+
+
+def available_profile_names() -> List[str]:
+    """List available profile names."""
+    return sorted(p.stem for p in PROFILES_DIR.glob("*.json"))
+
+
+def load_profiles(spec: str) -> List[Profile]:
+    """Load one or more profiles from a comma-separated profile spec."""
+    names = [part.strip() for part in spec.split(",") if part.strip()]
+    if not names:
+        raise ValueError("At least one profile must be specified.")
+
+    if any(name == "auto" for name in names):
+        names = available_profile_names()
+
+    profiles = []
+    seen = set()
+    for name in names:
+        profile = load_profile(name)
+        if profile.name not in seen:
+            profiles.append(profile)
+            seen.add(profile.name)
+    return profiles
+
+
 def parse_backend_spec(spec: str) -> Backend:
     """Parse a backend spec string into a Backend instance.
 
@@ -448,19 +390,25 @@ def parse_backend_spec(spec: str) -> Backend:
 
 # ── File handling ───────────────────────────────────────────────────────
 
-C_EXTENSIONS = {".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx"}
+DEFAULT_SKIP_DIRS = {"test", "tests", "testing", "t", "testdata"}
 
 
-def find_source_files(source_dir: str) -> List[Path]:
-    """Find all C/C++ source files, sorted by size (largest first)."""
+def find_source_files(source_dir: str, profiles: List[Profile]) -> List[SourceFile]:
+    """Find source files and dispatch them to the matching profile by extension."""
+    extension_map = {}
+    for profile in profiles:
+        for ext in profile.extensions:
+            extension_map[ext.lower()] = profile
+
     files = []
     for p in Path(source_dir).rglob("*"):
-        if p.suffix.lower() in C_EXTENSIONS and p.is_file():
+        profile = extension_map.get(p.suffix.lower())
+        if profile and p.is_file():
             parts = p.parts
-            if any(t in parts for t in ("test", "tests", "testing", "t", "testdata")):
+            if any(t in parts for t in DEFAULT_SKIP_DIRS):
                 continue
-            files.append(p)
-    files.sort(key=lambda p: p.stat().st_size, reverse=True)
+            files.append(SourceFile(path=p, profile=profile))
+    files.sort(key=lambda item: item.path.stat().st_size, reverse=True)
     return files
 
 
@@ -748,21 +696,23 @@ def checkout_obs_package(project_package: str, work_dir: str) -> str:
 
 # ── Pipeline stages ─────────────────────────────────────────────────────
 
-def run_scan_stage(files: List[Path], backend: Backend,
+def run_scan_stage(files: List[SourceFile], backend: Backend,
                    stage_name: str, source_dir: str, session_dir: Path):
     """Run a scanning stage over files and persist all outputs."""
-    for i, filepath in enumerate(files):
+    for i, source_file in enumerate(files):
+        filepath = source_file.path
+        profile = source_file.profile
         relpath = str(filepath.relative_to(source_dir))
         record_path = stage_record_path(session_dir, stage_name, relpath)
         if record_path.exists():
-            print(f"  [{i+1}/{len(files)}] {relpath} (cached)", flush=True)
+            print(f"  [{i+1}/{len(files)}] {relpath} [{profile.name}] (cached)", flush=True)
             continue
 
         code = filepath.read_text(errors="replace")
         chunks = chunk_file(code)
 
         print(
-            f"  [{i+1}/{len(files)}] {relpath} ({len(code)} chars, {len(chunks)} chunk(s))",
+            f"  [{i+1}/{len(files)}] {relpath} [{profile.name}] ({len(code)} chars, {len(chunks)} chunk(s))",
             flush=True,
         )
 
@@ -773,7 +723,7 @@ def run_scan_stage(files: List[Path], backend: Backend,
                 label = f"{relpath} (part {ci+1}/{len(chunks)})"
             user_msg = f"SOURCE FILE: {label}\n```\n{chunk}\n```"
 
-            system_prompt = STAGE_PROMPTS.get(stage_name, TRIAGE_PROMPT)
+            system_prompt = profile.triage_prompt if stage_name == "triage" else profile.reasoning_prompt
             raw = backend.query(system_prompt, user_msg)
             findings = parse_findings(raw, relpath, repr(backend), stage_name)
             chunk_records.append({
@@ -789,10 +739,12 @@ def run_scan_stage(files: List[Path], backend: Backend,
 
 
 def run_verdict_stage(consensus: List[dict], backend: Backend,
-                      source_dir: str, session_dir: Path) -> List[dict]:
+                      source_dir: str, session_dir: Path,
+                      profile_by_file: dict) -> List[dict]:
     """Run verdict stage: verify findings against source code."""
     for group in consensus:
         filepath = Path(source_dir) / group["findings"][0].file
+        profile = profile_by_file[group["findings"][0].file]
         if not filepath.exists():
             group["verdict"] = "FILE_NOT_FOUND"
             save_verdict_output(session_dir, group)
@@ -809,7 +761,7 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
         reasoning_items = [f for f in group["findings"] if f.stage == "reasoning"]
         consensus_note, hypothesis_note = build_verdict_group_notes(group)
 
-        prompt = VERDICT_PROMPT_TEMPLATE.format(
+        prompt = profile.verdict_prompt_template.format(
             filename=group["findings"][0].file,
             triage_findings=format_findings_for_verdict(triage_items),
             reasoning_findings=format_findings_for_verdict(reasoning_items),
@@ -861,6 +813,8 @@ def compute_consensus(findings: List[Finding]) -> List[dict]:
 def run_pipeline(args) -> ScanResult:
     """Run the full multi-stage scanning pipeline."""
     resume_session = getattr(args, "resume_session", None)
+    profile_spec = getattr(args, "profile", "auto")
+    profiles = load_profiles(profile_spec)
 
     # Parse backends
     triage_backend = parse_backend_spec(args.triage)
@@ -874,6 +828,7 @@ def run_pipeline(args) -> ScanResult:
         created_at = metadata["created_at"]
         package_name = metadata["package"]
         source_dir = metadata["source_dir"]
+        profiles = load_profiles(metadata.get("profiles", profile_spec))
         metadata["backends"] = {
             "triage": repr(triage_backend),
             "reasoning": repr(reasoning_backend) if reasoning_backend else None,
@@ -895,6 +850,7 @@ def run_pipeline(args) -> ScanResult:
             "session_id": session_id,
             "created_at": created_at,
             "package": package_name,
+            "profiles": ",".join(profile.name for profile in profiles),
             "source_dir": None,
             "obs_package": args.obs_package,
             "backends": {
@@ -925,7 +881,7 @@ def run_pipeline(args) -> ScanResult:
         created_at=created_at,
     )
 
-    files = find_source_files(source_dir)
+    files = find_source_files(source_dir, profiles)
     if not files:
         print(f"No C/C++ source files found in {source_dir}", flush=True)
         return result
@@ -947,16 +903,16 @@ def run_pipeline(args) -> ScanResult:
 
     if not triage_findings:
         print("\nTriage: All files clean.", flush=True)
-        result.clean_files = [str(f.relative_to(source_dir)) for f in files]
+        result.clean_files = [str(f.path.relative_to(source_dir)) for f in files]
         result.stage_stats = compute_stage_stats(session_dir)
         return result
 
     flagged_files = {f.file for f in triage_findings}
     result.files_with_findings = len(flagged_files)
     result.clean_files = [
-        str(f.relative_to(source_dir))
+        str(f.path.relative_to(source_dir))
         for f in files
-        if str(f.relative_to(source_dir)) not in flagged_files
+        if str(f.path.relative_to(source_dir)) not in flagged_files
     ]
     print(
         f"\nTriage: {len(triage_findings)} findings in {len(flagged_files)} files",
@@ -973,7 +929,7 @@ def run_pipeline(args) -> ScanResult:
     print(f"REASONING ({reasoning_backend})", flush=True)
     print(f"{'='*60}", flush=True)
 
-    flagged_paths = [f for f in files if str(f.relative_to(source_dir)) in flagged_files]
+    flagged_paths = [f for f in files if str(f.path.relative_to(source_dir)) in flagged_files]
     run_scan_stage(
         flagged_paths, reasoning_backend, "reasoning", source_dir, session_dir
     )
@@ -999,7 +955,8 @@ def run_pipeline(args) -> ScanResult:
     print(f"VERDICT ({verdict_backend})", flush=True)
     print(f"{'='*60}", flush=True)
 
-    consensus = run_verdict_stage(consensus, verdict_backend, source_dir, session_dir)
+    profile_by_file = {str(f.path.relative_to(source_dir)): f.profile for f in files}
+    consensus = run_verdict_stage(consensus, verdict_backend, source_dir, session_dir, profile_by_file)
 
     # Filter: keep only confirmed findings
     for group in consensus:
@@ -1095,6 +1052,9 @@ Backend spec format: backend/model[@url]
     parser.add_argument("--json", default=None, help="JSON output path")
     parser.add_argument("--scratch-dir", default="/tmp/opensuse-security-scanner",
                         help="Scratch root for per-run session directories")
+    parser.add_argument("--profile", default="auto",
+                        help="Technology profile set: auto or comma-separated names "
+                             "(e.g. c_cpp,python,bash)")
 
     # Stage configuration
     parser.add_argument("--triage", default="ollama/gpt-oss-20b",

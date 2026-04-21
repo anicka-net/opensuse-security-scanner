@@ -51,7 +51,7 @@ everything and makes the final call.
 ## Quick start
 
 ```bash
-# Scan an OBS package with local models (ollama)
+# Scan an OBS package with automatic per-file language dispatch
 python3 scan.py --obs-package openSUSE:Factory/zypper
 
 # Scan a local source tree
@@ -59,6 +59,9 @@ python3 scan.py --source-dir /path/to/extracted-source
 
 # Triage only (single stage, fast)
 python3 scan.py --source-dir ./src --triage-only
+
+# Force only specific language families instead of auto-detecting by extension
+python3 scan.py --source-dir ./src --profile c_cpp,python,bash
 ```
 
 For regular use, prefer local models for triage and reasoning and reserve
@@ -107,6 +110,12 @@ Every stage accepts a backend spec in `backend/model[@url]` format:
 ### Examples
 
 ```bash
+# Package-wide auto dispatch across all known profiles
+--profile auto
+
+# Limit scanning to selected language families
+--profile c_cpp,python,bash
+
 # All local (two GPUs)
 --triage ollama/gpt-oss-20b --reasoning ollama/gemma4:31b
 
@@ -121,6 +130,26 @@ Every stage accepts a backend spec in `backend/model[@url]` format:
 ```
 
 ## What each stage does
+
+## Profiles
+
+`--profile auto` is the default and is the recommended mode for whole-package scans.
+It activates all known language profiles and dispatches each file to the matching
+prompt family by extension.
+
+Currently included profiles:
+
+| Profile | Extensions |
+|---------|------------|
+| `c_cpp` | `.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx` |
+| `python` | `.py` |
+| `bash` | `.sh`, `.bash` |
+| `ruby` | `.rb`, `.rake`, `.gemspec` |
+| `perl` | `.pl`, `.pm`, `.t` |
+| `rust` | `.rs` |
+| `node` | `.js`, `.mjs`, `.cjs`, `.ts` |
+
+For mixed packages in openSUSE, `auto` is usually the right choice.
 
 ### Triage
 
