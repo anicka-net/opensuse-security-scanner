@@ -282,7 +282,7 @@ def test_parse_findings_without_source_sink():
 
 
 def test_verdict_formats_findings_by_stage():
-    """Verdict stage receives findings grouped by stage with consensus note."""
+    """Verdict stage receives numbered findings grouped by stage."""
     triage_finding = scan.Finding(
         severity="High", location="vuln()", type="overflow",
         description="triage found overflow", exploitation="",
@@ -303,12 +303,52 @@ def test_verdict_formats_findings_by_stage():
     # Simulate what run_verdict_stage builds
     triage_items = [f for f in group["findings"] if f.stage == "triage"]
     reasoning_items = [f for f in group["findings"] if f.stage == "reasoning"]
-    assert len(triage_items) == 1
-    assert len(reasoning_items) == 1
-    assert reasoning_items[0].source == "user input via argv"
+    triage_text = scan.format_findings_for_verdict(triage_items)
+    reasoning_text = scan.format_findings_for_verdict(reasoning_items)
+    consensus_note, hypothesis_note = scan.build_verdict_group_notes(group)
 
-    # Consensus note for cross-stage confirmation
-    assert group["count"] > 1
+    assert "1. [High] vuln(): triage found overflow" in triage_text
+    assert "1. [High] vuln(): chain: user input -> memcpy" in reasoning_text
+    assert "Source: user input via argv" in reasoning_text
+    assert "Sink: memcpy without bounds" in reasoning_text
+    assert "Both stages independently flagged this location" in consensus_note
+    assert "Multiple findings were merged into this grouped location" in hypothesis_note
+
+
+def test_verdict_notes_multiple_reasoning_hypotheses():
+    """Verdict gets an explicit note when reasoning produced multiple chains."""
+    group = {
+        "findings": [
+            scan.Finding(
+                severity="High", location="vuln()", type="overflow",
+                description="path one", exploitation="",
+                file="test.c", model="triage-model", stage="triage",
+            ),
+            scan.Finding(
+                severity="High", location="vuln()", type="overflow",
+                description="argv reaches memcpy", exploitation="",
+                file="test.c", model="reason-model", stage="reasoning",
+                source="argv", sink="memcpy",
+            ),
+            scan.Finding(
+                severity="High", location="vuln()", type="overflow",
+                description="env reaches strcpy", exploitation="",
+                file="test.c", model="reason-model", stage="reasoning",
+                source="ENV_VAR", sink="strcpy",
+            ),
+        ],
+        "stages": {"triage", "reasoning"},
+        "count": 2,
+    }
+
+    _, hypothesis_note = scan.build_verdict_group_notes(group)
+    reasoning_text = scan.format_findings_for_verdict(
+        [f for f in group["findings"] if f.stage == "reasoning"]
+    )
+
+    assert "2 distinct source/sink hypotheses" in hypothesis_note
+    assert "1. [High] vuln(): argv reaches memcpy" in reasoning_text
+    assert "2. [High] vuln(): env reaches strcpy" in reasoning_text
 
 
 # ── Report rendering ──────────────────────────────────────────────────

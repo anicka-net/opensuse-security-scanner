@@ -155,6 +155,7 @@ for {filename}. Two independent scanners have already analyzed this code:
 {reasoning_findings}
 
 {consensus_note}
+{hypothesis_note}
 
 Your job is to deliver the final verdict on each finding:
 1. Is it a REAL vulnerability or a false positive?
@@ -583,6 +584,55 @@ def load_stage_findings(session_dir: Path, stage_name: str) -> List[Finding]:
     return findings
 
 
+def format_findings_for_verdict(items: List[Finding]) -> str:
+    """Render grouped findings so verdict can distinguish separate hypotheses."""
+    if not items:
+        return "(not flagged by this stage)"
+
+    lines = []
+    for idx, f in enumerate(items, 1):
+        line = f"{idx}. [{f.severity}] {f.location}: {f.description}"
+        if f.source:
+            line += f"\n   Source: {f.source}"
+        if f.sink:
+            line += f"\n   Sink: {f.sink}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def build_verdict_group_notes(group: dict) -> Tuple[str, str]:
+    """Explain confidence and when a group contains multiple hypotheses."""
+    if group["count"] > 1:
+        consensus_note = ("Both stages independently flagged this location — "
+                          "higher confidence this is a real issue.")
+    else:
+        stage = list(group["stages"])[0] if group.get("stages") else "unknown"
+        consensus_note = (f"Only flagged by {stage} stage — "
+                          f"the other stage did not find this. Examine carefully.")
+
+    reasoning_with_chain = [
+        f for f in group["findings"]
+        if f.stage == "reasoning" and (f.source or f.sink)
+    ]
+    if len(reasoning_with_chain) > 1:
+        hypothesis_note = (
+            f"Reasoning stage supplied {len(reasoning_with_chain)} distinct "
+            "source/sink hypotheses for this grouped location. They may describe "
+            "the same bug from different angles or different exploit paths. "
+            "Assess each numbered hypothesis before collapsing them together."
+        )
+    elif len(group["findings"]) > 1:
+        hypothesis_note = (
+            "Multiple findings were merged into this grouped location. Review the "
+            "numbered items below before deciding whether they describe one bug "
+            "or multiple related paths."
+        )
+    else:
+        hypothesis_note = ""
+
+    return consensus_note, hypothesis_note
+
+
 # ── Finding parser ──────────────────────────────────────────────────────
 
 def parse_findings(raw: str, filename: str, model: str, stage: str) -> List[Finding]:
@@ -725,33 +775,14 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
         # Format findings by stage so verdict sees what each scanner found
         triage_items = [f for f in group["findings"] if f.stage == "triage"]
         reasoning_items = [f for f in group["findings"] if f.stage == "reasoning"]
-
-        def _fmt_findings(items):
-            if not items:
-                return "(not flagged by this stage)"
-            lines = []
-            for f in items:
-                line = f"- [{f.severity}] {f.location}: {f.description}"
-                if f.source:
-                    line += f"\n  Source: {f.source}"
-                if f.sink:
-                    line += f"\n  Sink: {f.sink}"
-                lines.append(line)
-            return "\n".join(lines)
-
-        if group["count"] > 1:
-            consensus_note = ("Both stages independently flagged this location — "
-                              "higher confidence this is a real issue.")
-        else:
-            stage = list(group["stages"])[0] if group.get("stages") else "unknown"
-            consensus_note = (f"Only flagged by {stage} stage — "
-                              f"the other stage did not find this. Examine carefully.")
+        consensus_note, hypothesis_note = build_verdict_group_notes(group)
 
         prompt = VERDICT_PROMPT_TEMPLATE.format(
             filename=group["findings"][0].file,
-            triage_findings=_fmt_findings(triage_items),
-            reasoning_findings=_fmt_findings(reasoning_items),
+            triage_findings=format_findings_for_verdict(triage_items),
+            reasoning_findings=format_findings_for_verdict(reasoning_items),
             consensus_note=consensus_note,
+            hypothesis_note=hypothesis_note,
             code=code,
         )
         raw = backend.query("", prompt)
