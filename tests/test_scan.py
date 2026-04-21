@@ -625,6 +625,48 @@ def test_main_rejects_unknown_config_keys(tmp_path):
     assert "Unknown config key(s): totally_wrong" in result.stderr
 
 
+def test_main_rejects_conflicting_config_sources(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "tool.py").write_text("print('hi')\n")
+    (tmp_path / "config.toml").write_text(
+        'source_dir = "src"\n'
+        'obs_package = "openSUSE:Factory/zypper"\n'
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(Path(scan.__file__).resolve())],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "mutually exclusive" in result.stderr
+
+
+def test_main_rejects_wrong_config_value_types(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "tool.py").write_text("print('hi')\n")
+    (tmp_path / "config.toml").write_text(
+        'source_dir = "src"\n'
+        'profile = 123\n'
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(Path(scan.__file__).resolve())],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "Config key 'profile' must be a string." in result.stderr
+
+
 # ── Include / import resolution tests ──────────────────────────────────
 
 

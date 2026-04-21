@@ -1281,6 +1281,24 @@ CONFIG_KEYS = {
     "triage_only",
 }
 
+CONFIG_STRING_KEYS = {
+    "source_dir",
+    "obs_package",
+    "resume_session",
+    "package_name",
+    "output",
+    "json",
+    "scratch_dir",
+    "profile",
+    "triage",
+    "reasoning",
+    "verdict",
+}
+
+CONFIG_BOOL_KEYS = {
+    "triage_only",
+}
+
 
 def load_config_file(path: Path) -> dict:
     """Load and validate TOML config."""
@@ -1295,6 +1313,21 @@ def load_config_file(path: Path) -> dict:
         raise ValueError(
             "Unknown config key(s): " + ", ".join(unknown) +
             ". Supported keys: " + ", ".join(sorted(CONFIG_KEYS))
+        )
+
+    for key in CONFIG_STRING_KEYS:
+        if key in config and config[key] is not None and not isinstance(config[key], str):
+            raise ValueError(f"Config key {key!r} must be a string.")
+
+    for key in CONFIG_BOOL_KEYS:
+        if key in config and not isinstance(config[key], bool):
+            raise ValueError(f"Config key {key!r} must be a boolean.")
+
+    source_keys = [key for key in ("source_dir", "obs_package", "resume_session") if config.get(key)]
+    if len(source_keys) > 1:
+        raise ValueError(
+            "Config keys source_dir, obs_package, and resume_session are mutually exclusive. "
+            f"Got: {', '.join(source_keys)}"
         )
 
     return config
