@@ -9,6 +9,13 @@ This tool is designed for analyst assistance, not autonomous security
 sign-off. A "clean" report means "nothing survived this pipeline under
 this model mix," not "this package is vulnerability-free."
 
+This scanner is directly inspired by AISLE's "AI Cybersecurity After Mythos:
+The Jagged Frontier" methodology: treat AI cybersecurity as a modular system,
+not a single magic model; use cheap, broad scanning where possible; use a
+different deeper reasoning stage for validation; and keep the scaffold and
+artifacts inspectable. In that sense, the design here follows the same core
+lesson: the moat is the system, not the model.
+
 ## How it works
 
 ```
