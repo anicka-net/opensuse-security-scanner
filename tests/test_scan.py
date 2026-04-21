@@ -557,6 +557,125 @@ def test_report_includes_stage_summary(tmp_path):
     assert "**Triage**: 2 files, 1 with findings, 2 total findings" in text
 
 
+def test_find_cross_references_uses_invocation_shaped_matches(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "vuln.cpp").write_text("void exec() {}\n")
+    (tmp_path / "src" / "caller.cpp").write_text("int main() { exec(); }\n")
+    (tmp_path / "src" / "noise.cpp").write_text(
+        "void execute() {}\n"
+        "// exec() in a comment should not count\n"
+        "const char *s = \"exec() in a string\";\n"
+    )
+
+    finding = scan.Finding(
+        severity="High",
+        location="exec",
+        type="command injection",
+        description="desc",
+        exploitation="exploit",
+        file="src/vuln.cpp",
+        model="claude/sonnet",
+        stage="reasoning",
+    )
+
+    result = scan.find_cross_references(finding, str(tmp_path), "src/vuln.cpp")
+    assert "caller.cpp:1:int main() { exec(); }" in result
+    assert "noise.cpp" not in result
+    assert "heuristic reference lines" in result
+
+
+def test_find_cross_references_covers_supported_extensions(tmp_path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "vuln.rb").write_text("def run_task; end\n")
+    (tmp_path / "pkg" / "task.rake").write_text("run_task()\n")
+
+    finding = scan.Finding(
+        severity="Medium",
+        location="run_task",
+        type="logic bug",
+        description="desc",
+        exploitation="exploit",
+        file="pkg/vuln.rb",
+        model="claude/sonnet",
+        stage="reasoning",
+    )
+
+    result = scan.find_cross_references(finding, str(tmp_path), "pkg/vuln.rb")
+    assert "pkg/task.rake:1:run_task()" in result
+
+
+def test_generate_report_uses_final_verdict_severity(tmp_path):
+    session_dir = tmp_path / "session"
+    (session_dir / "verdict").mkdir(parents=True)
+    scan.write_json(
+        session_dir / "verdict" / "finding.json",
+        {
+            "file": "src/vuln.c",
+            "key": "src/vuln.c:main:overflow",
+            "created_at": "2026-04-21T12:34:56+00:00",
+            "verdict": "CONFIRMED",
+            "real_severity": "Low",
+            "verdict_raw": "VERDICT: CONFIRMED\nREAL_SEVERITY: Low\nREASONING: reachable but limited",
+            "findings": [{
+                "severity": "High",
+                "location": "main()",
+                "type": "overflow",
+                "description": "bad bounds",
+                "exploitation": "attacker controls input",
+                "file": "src/vuln.c",
+                "model": "gemini/flash",
+                "stage": "triage",
+                "source": "",
+                "sink": "",
+            }],
+            "confirmation_count": 2,
+            "stages": ["reasoning", "triage"],
+        },
+    )
+    result = scan.ScanResult(
+        package="pkg",
+        files_scanned=1,
+        files_with_findings=1,
+        session_id="session",
+        session_dir=str(session_dir),
+        created_at="2026-04-21T12:34:56+00:00",
+        stage_stats={"triage": {"completed_files": 1, "files_with_findings": 1, "total_findings": 1}},
+    )
+
+    output = tmp_path / "report.md"
+    scan.generate_report(result, str(output))
+    text = output.read_text()
+    assert "### [Low] main()" in text
+    assert "**Final severity**: Low" in text
+    assert "reachable but limited" in text
+
+
+def test_save_verdict_output_persists_real_severity(tmp_path):
+    session_id, session_dir = scan.make_session_dir(str(tmp_path), "pkg")
+    finding = scan.Finding(
+        severity="High",
+        location="main()",
+        type="overflow",
+        description="desc",
+        exploitation="exploit",
+        file="src/vuln.c",
+        model="gemini/flash",
+        stage="triage",
+    )
+    group = {
+        "findings": [finding],
+        "count": 1,
+        "stages": {"triage"},
+        "verdict": "CONFIRMED",
+        "real_severity": "Medium",
+        "verdict_raw": "VERDICT: CONFIRMED\nREAL_SEVERITY: Medium\nREASONING: tested",
+    }
+
+    scan.save_verdict_output(session_dir, group)
+    payload = json.loads(next((session_dir / "verdict").rglob("*.json")).read_text())
+    assert payload["real_severity"] == "Medium"
+
+
 def test_main_loads_config_file(tmp_path):
     src = tmp_path / "src"
     src.mkdir()

@@ -1068,6 +1068,7 @@ def save_verdict_output(session_dir: Path, group: dict):
         "key": first.key(),
         "created_at": utc_now(),
         "verdict": group.get("verdict", "NEEDS_CONTEXT"),
+        "real_severity": group.get("real_severity"),
         "verdict_raw": group.get("verdict_raw", ""),
         "findings": [asdict(f) for f in group["findings"]],
         "confirmation_count": group["count"],
@@ -1325,23 +1326,16 @@ def run_scan_stage(files: List[SourceFile], backend: Backend,
 
 def find_cross_references(finding: Finding, source_dir: str,
                           finding_file: str) -> str:
-    """Find call sites of the flagged function across the source tree.
+    """Find likely cross-file references for the flagged symbol.
 
-    Extracts a function/class name from the finding location, greps
-    the source tree for references in OTHER files, and returns context
-    snippets showing how the vulnerable code is actually invoked.
+    This is a heuristic: it extracts a likely symbol from the finding
+    and searches other project files for invocation-shaped references.
     """
-    # Extract the function/method name from the finding location
-    # e.g., "Util::exec (lib/Util.cpp)" → "Util::exec"
-    # e.g., "closeSnapshot" → "closeSnapshot"
     location = finding.location or ""
-    # Try to extract a searchable identifier
     candidates = []
-    # "Class::method" or "function_name"
     match = re.match(r'(\w+(?:::\w+)?)', location)
     if match:
         candidates.append(match.group(1))
-    # Also check the sink field — often has the specific function
     if finding.sink:
         sink_match = re.match(r'[`]?(\w+(?:::\w+)?)', finding.sink)
         if sink_match:
@@ -1351,38 +1345,46 @@ def find_cross_references(finding: Finding, source_dir: str,
         return ""
 
     snippets = []
+    seen = set()
     budget = 6000  # chars budget for cross-references
     src = Path(source_dir)
+    include_patterns = [
+        "*.cpp", "*.c", "*.h", "*.hpp",
+        "*.py", "*.rb", "*.rake", "*.gemspec", "*.sh",
+        "*.rs", "*.js", "*.ts", "*.mjs", "*.cjs",
+        "*.pl", "*.pm", "*.t",
+    ]
 
     for term in candidates:
-        # Skip very generic terms
         if term.lower() in ("return", "if", "for", "while", "int", "void",
                             "string", "char", "bool", "auto", "const"):
             continue
+        pattern = _cross_reference_regex(term)
+        if not pattern:
+            continue
         try:
             result = subprocess.run(
-                ["grep", "-rn", "--include=*.cpp", "--include=*.c",
-                 "--include=*.h", "--include=*.hpp",
-                 "--include=*.py", "--include=*.rb", "--include=*.sh",
-                 "--include=*.rs", "--include=*.js", "--include=*.ts",
-                 "--include=*.pl", "--include=*.pm",
-                 term, source_dir],
+                ["grep", "-rEn", *[f"--include={p}" for p in include_patterns],
+                 pattern, source_dir],
                 capture_output=True, text=True, timeout=10,
             )
         except (subprocess.TimeoutExpired, OSError):
             continue
 
         for line in result.stdout.splitlines():
-            # Skip matches in the same file (verdict already sees it)
             try:
-                match_file = line.split(":", 1)[0]
+                match_file, lineno, content = line.split(":", 2)
                 relpath = str(Path(match_file).relative_to(src))
             except (ValueError, IndexError):
                 continue
             if relpath == finding_file:
                 continue
-            # Include this cross-reference
-            snippet = line.replace(source_dir + "/", "")
+            if not _looks_like_cross_reference(content, term):
+                continue
+            snippet = f"{relpath}:{lineno}:{content.strip()}"
+            if snippet in seen:
+                continue
+            seen.add(snippet)
             if len(snippet) <= budget:
                 snippets.append(snippet)
                 budget -= len(snippet) + 1
@@ -1395,9 +1397,45 @@ def find_cross_references(finding: Finding, source_dir: str,
         return ""
 
     return (
-        "\n\nCROSS-REFERENCES (call sites of flagged functions in other files):\n"
+        "\n\nPOSSIBLE CROSS-FILE REFERENCES:\n"
+        "These are heuristic reference lines from other files, not verified call sites.\n"
+        "Use them only as auxiliary context when judging exploitability.\n"
         + "\n".join(snippets)
     )
+
+
+def _cross_reference_regex(term: str) -> str:
+    """Build a grep regex for invocation-shaped references to a symbol."""
+    escaped = re.escape(term)
+    if "::" in term:
+        return rf'(^|[^A-Za-z0-9_]){escaped}\s*\('
+    return rf'(^|[^A-Za-z0-9_:.>])(?:[A-Za-z_]\w*(?:::\w+|->\w+|\.\w+)?\s*)?{escaped}\s*\('
+
+
+def _looks_like_cross_reference(content: str, term: str) -> bool:
+    """Filter grep matches down to plausible invocation references."""
+    stripped = content.strip()
+    if not stripped:
+        return False
+    if stripped.startswith(("#", "//", "/*", "*", "import ", "from ", "use ",
+                            "require ", "require_relative ", "include ", ".include")):
+        return False
+    if re.match(r'^\s*(class|struct|enum|typedef|using|namespace|module|package|trait|impl)\b', stripped):
+        return False
+    if re.match(r'^\s*(def|sub|fn)\s+', stripped):
+        return False
+    if re.match(r'^\s*(public|private|protected|static|virtual|inline|extern|export)\b.*\b'
+                + re.escape(term.split("::")[-1]) + r'\s*\(', stripped):
+        return False
+    if re.match(r'^\s*[\w:<>&*\[\],\s]+\b' + re.escape(term.split("::")[-1]) + r'\s*\([^;{]*\)\s*(?:\{|;)?\s*$',
+                stripped):
+        return False
+    if re.match(r'^\s*[^=]+=\s*["\'][^"\']*' + re.escape(term.split("::")[-1]) + r'\s*\([^"\']*["\']\s*;?\s*$',
+                stripped):
+        return False
+    if re.match(r'^[\'"`].*[\'"`]\s*$', stripped):
+        return False
+    return True
 
 
 def run_verdict_stage(consensus: List[dict], backend: Backend,
@@ -1439,7 +1477,14 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
             reasoning_findings=format_findings_for_verdict(reasoning_items),
             consensus_note=consensus_note,
             hypothesis_note=hypothesis_note,
-            code=code + xrefs,
+            code=code + (
+                "\n\n// === Auxiliary cross-file reference hints ===\n"
+                "// The following section is heuristic context from other files.\n"
+                "// It is not part of the source file above and it is not a verified call graph.\n"
+                f"{xrefs}\n"
+                "// === End auxiliary cross-file reference hints ===\n"
+                if xrefs else ""
+            ),
         )
         raw = backend.query("", prompt)
         group["verdict_raw"] = raw
@@ -1451,6 +1496,8 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
             group["verdict"] = verdict_match.group(1)
         else:
             group["verdict"] = "NEEDS_CONTEXT"
+        severity_match = re.search(r"REAL_SEVERITY:\s*(Critical|High|Medium|Low|None)", raw)
+        group["real_severity"] = severity_match.group(1) if severity_match else None
 
         status = group["verdict"]
         print(f"  {group['findings'][0].file}: {status}", flush=True)
@@ -1741,11 +1788,14 @@ def _format_verdict_finding(lines: list, payload: dict):
     finding = payload.get("findings", [{}])[0]
     stages = payload.get("stages", [])
     stage_str = " + ".join(stages) if stages else "?"
+    display_severity = payload.get("real_severity") or finding.get("severity", "?")
 
-    lines.append(f"### [{finding.get('severity', '?')}] {finding.get('location', '?')}")
+    lines.append(f"### [{display_severity}] {finding.get('location', '?')}")
     lines.append(f"**File**: {payload.get('file', '?')}")
     lines.append(f"**Type**: {finding.get('type', '?')}")
     lines.append(f"**Stages**: {stage_str}")
+    if payload.get("real_severity"):
+        lines.append(f"**Final severity**: {payload['real_severity']}")
     if finding.get("source"):
         lines.append(f"**Source**: {finding['source']}")
     if finding.get("sink"):
