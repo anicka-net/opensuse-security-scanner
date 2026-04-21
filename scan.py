@@ -215,8 +215,10 @@ class ClaudeBackend(Backend):
         model_id = self._model_map.get(self.model, self.model)
         prompt = f"{system}\n\n{user}"
         try:
+            # Pipe prompt via stdin to avoid CLI arg length limits
             result = subprocess.run(
-                ["claude", "--print", "--model", model_id, "--bare", "-p", prompt],
+                ["claude", "--print", "--model", model_id, "--bare"],
+                input=prompt,
                 capture_output=True, text=True, timeout=300,
             )
             if result.returncode == 0:
@@ -248,8 +250,11 @@ class GeminiBackend(Backend):
         model_id = self._model_map.get(self.model, self.model)
         prompt = f"{system}\n\n{user}"
         try:
+            # Pipe prompt via stdin, -p "" triggers non-interactive mode
+            # while reading the actual prompt from stdin (avoids arg limits)
             result = subprocess.run(
-                ["gemini", "-p", prompt, "-m", model_id],
+                ["gemini", "-p", "", "-m", model_id],
+                input=prompt,
                 capture_output=True, text=True, timeout=300,
             )
             if result.returncode == 0:
@@ -286,11 +291,14 @@ class CodexBackend(Backend):
             outpath = f.name
 
         try:
-            cmd = ["codex", "exec", prompt, "-o", outpath]
+            # Use "-" as prompt arg to read from stdin (avoids CLI arg
+            # length limits on large prompts like verdict with source code)
+            cmd = ["codex", "exec", "-", "-o", outpath]
             if self.model:
                 cmd.extend(["-m", self.model])
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=300,
+                cmd, input=prompt,
+                capture_output=True, text=True, timeout=300,
             )
             if os.path.exists(outpath):
                 with open(outpath) as f:
