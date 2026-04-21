@@ -41,13 +41,16 @@ Usage:
   scan.py --source-dir /path/to/src --triage-only
 """
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -139,6 +142,9 @@ class ScanResult:
     package: str
     files_scanned: int
     files_with_findings: int
+    session_id: str = ""
+    session_dir: str = ""
+    created_at: str = ""
     findings: List[Finding] = field(default_factory=list)
     clean_files: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
@@ -417,6 +423,107 @@ def chunk_file(code: str, max_chars: int = 20000) -> List[str]:
     return chunks
 
 
+def utc_now() -> str:
+    """Return a UTC ISO-8601 timestamp."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def make_session_dir(scratch_dir: str, package_name: str) -> Tuple[str, Path]:
+    """Create a per-run session directory in scratch space."""
+    safe_package = re.sub(r"[^A-Za-z0-9_.-]+", "-", package_name).strip("-") or "scan"
+    session_id = str(uuid.uuid4())
+    session_root = Path(scratch_dir).expanduser().resolve() / f"{safe_package}-{session_id}"
+    session_root.mkdir(parents=True, exist_ok=False)
+    for name in ("triage", "reasoning", "verdict"):
+        (session_root / name).mkdir()
+    return session_id, session_root
+
+
+def write_json(path: Path, payload: dict):
+    """Write JSON with stable formatting."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+
+def append_jsonl(path: Path, payload: dict):
+    """Append one JSON object per line."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        json.dump(payload, f)
+        f.write("\n")
+
+
+def stage_record_path(session_dir: Path, stage_name: str, relpath: str) -> Path:
+    """Return the per-file stage record path inside the session."""
+    return session_dir / stage_name / f"{relpath}.json"
+
+
+def consensus_record_path(session_dir: Path, finding: Finding) -> Path:
+    """Return the per-consensus-group verdict record path."""
+    digest = hashlib.sha1(finding.key().encode("utf-8")).hexdigest()[:12]
+    return session_dir / "verdict" / f"{finding.file}.{digest}.json"
+
+
+def save_stage_file_output(session_dir: Path, stage_name: str, backend: Backend,
+                           relpath: str, chunk_records: List[dict]):
+    """Persist all outputs for one file in one stage."""
+    findings = []
+    for chunk in chunk_records:
+        findings.extend(chunk["findings"])
+
+    payload = {
+        "file": relpath,
+        "stage": stage_name,
+        "backend": repr(backend),
+        "created_at": utc_now(),
+        "chunk_count": len(chunk_records),
+        "finding_count": len(findings),
+        "chunks": chunk_records,
+        "findings": findings,
+    }
+    write_json(stage_record_path(session_dir, stage_name, relpath), payload)
+    append_jsonl(
+        session_dir / "progress.jsonl",
+        {
+            "created_at": payload["created_at"],
+            "stage": stage_name,
+            "file": relpath,
+            "backend": repr(backend),
+            "chunk_count": len(chunk_records),
+            "finding_count": len(findings),
+        },
+    )
+
+
+def save_verdict_output(session_dir: Path, group: dict):
+    """Persist verdict output for one consensus group."""
+    first = group["findings"][0]
+    payload = {
+        "file": first.file,
+        "key": first.key(),
+        "created_at": utc_now(),
+        "verdict": group.get("verdict", "NEEDS_CONTEXT"),
+        "verdict_raw": group.get("verdict_raw", ""),
+        "findings": [asdict(f) for f in group["findings"]],
+        "confirmation_count": group["count"],
+        "stages": sorted(group.get("stages", [])),
+    }
+    write_json(consensus_record_path(session_dir, first), payload)
+
+
+def load_stage_findings(session_dir: Path, stage_name: str) -> List[Finding]:
+    """Load parsed findings for a stage from the session directory."""
+    findings = []
+    for path in sorted((session_dir / stage_name).rglob("*.json")):
+        with path.open() as f:
+            payload = json.load(f)
+        for entry in payload.get("findings", []):
+            findings.append(Finding(**entry))
+    return findings
+
+
 # ── Finding parser ──────────────────────────────────────────────────────
 
 def parse_findings(raw: str, filename: str, model: str, stage: str) -> List[Finding]:
@@ -475,7 +582,7 @@ def checkout_obs_package(project_package: str, work_dir: str) -> str:
     """Checkout a package from OBS and extract source."""
     project, package = project_package.split("/", 1)
 
-    print(f"Checking out {project}/{package}...")
+    print(f"Checking out {project}/{package}...", flush=True)
     subprocess.run(
         ["osc", "co", project, package],
         cwd=work_dir, check=True, capture_output=True,
@@ -502,16 +609,19 @@ def checkout_obs_package(project_package: str, work_dir: str) -> str:
 # ── Pipeline stages ─────────────────────────────────────────────────────
 
 def run_scan_stage(files: List[Path], backend: Backend,
-                   stage_name: str, source_dir: str) -> List[Finding]:
-    """Run a scanning stage over files using the given backend."""
-    all_findings = []
+                   stage_name: str, source_dir: str, session_dir: Path):
+    """Run a scanning stage over files and persist all outputs."""
     for i, filepath in enumerate(files):
         relpath = str(filepath.relative_to(source_dir))
         code = filepath.read_text(errors="replace")
         chunks = chunk_file(code)
 
-        print(f"  [{i+1}/{len(files)}] {relpath} ({len(code)} chars, {len(chunks)} chunk(s))")
+        print(
+            f"  [{i+1}/{len(files)}] {relpath} ({len(code)} chars, {len(chunks)} chunk(s))",
+            flush=True,
+        )
 
+        chunk_records = []
         for ci, chunk in enumerate(chunks):
             label = relpath
             if len(chunks) > 1:
@@ -520,21 +630,26 @@ def run_scan_stage(files: List[Path], backend: Backend,
 
             raw = backend.query(SYSTEM_PROMPT, user_msg)
             findings = parse_findings(raw, relpath, repr(backend), stage_name)
+            chunk_records.append({
+                "chunk_index": ci + 1,
+                "label": label,
+                "raw_output": raw,
+                "findings": [asdict(f) for f in findings],
+            })
             if findings:
                 for f in findings:
-                    print(f"    -> {f.severity}: {f.location} ({f.type})")
-                all_findings.extend(findings)
-
-    return all_findings
+                    print(f"    -> {f.severity}: {f.location} ({f.type})", flush=True)
+        save_stage_file_output(session_dir, stage_name, backend, relpath, chunk_records)
 
 
 def run_verdict_stage(consensus: List[dict], backend: Backend,
-                      source_dir: str) -> List[dict]:
+                      source_dir: str, session_dir: Path) -> List[dict]:
     """Run verdict stage: verify findings against source code."""
     for group in consensus:
         filepath = Path(source_dir) / group["findings"][0].file
         if not filepath.exists():
             group["verdict"] = "FILE_NOT_FOUND"
+            save_verdict_output(session_dir, group)
             continue
 
         full_code = filepath.read_text(errors="replace")
@@ -564,7 +679,8 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
             group["verdict"] = "NEEDS_CONTEXT"
 
         status = group["verdict"]
-        print(f"  {group['findings'][0].file}: {status}")
+        print(f"  {group['findings'][0].file}: {status}", flush=True)
+        save_verdict_output(session_dir, group)
 
     return consensus
 
@@ -599,34 +715,70 @@ def run_pipeline(args) -> ScanResult:
     reasoning_backend = parse_backend_spec(args.reasoning) if not args.triage_only else None
     verdict_backend = parse_backend_spec(args.verdict) if args.verdict else None
 
+    package_name = args.package_name
+    if args.obs_package:
+        package_name = package_name or args.obs_package.split("/")[-1]
+    elif args.source_dir:
+        package_name = package_name or Path(args.source_dir).name
+    else:
+        package_name = package_name or "scan"
+
+    session_id, session_dir = make_session_dir(args.scratch_dir, package_name)
+    created_at = utc_now()
+    metadata = {
+        "session_id": session_id,
+        "created_at": created_at,
+        "package": package_name,
+        "source_dir": None,
+        "obs_package": args.obs_package,
+        "backends": {
+            "triage": repr(triage_backend),
+            "reasoning": repr(reasoning_backend) if reasoning_backend else None,
+            "verdict": repr(verdict_backend) if verdict_backend else None,
+        },
+    }
+    write_json(session_dir / "metadata.json", metadata)
+
     # Resolve source
     if args.obs_package:
-        work_dir = tempfile.mkdtemp(prefix="scanner-")
+        work_dir = str(session_dir / "work")
+        Path(work_dir).mkdir(parents=True, exist_ok=True)
         source_dir = checkout_obs_package(args.obs_package, work_dir)
-        package_name = args.obs_package.split("/")[-1]
     else:
         source_dir = args.source_dir
-        package_name = args.package_name or Path(source_dir).name
 
-    result = ScanResult(package=package_name, files_scanned=0, files_with_findings=0)
+    metadata["source_dir"] = source_dir
+    write_json(session_dir / "metadata.json", metadata)
+
+    result = ScanResult(
+        package=package_name,
+        files_scanned=0,
+        files_with_findings=0,
+        session_id=session_id,
+        session_dir=str(session_dir),
+        created_at=created_at,
+    )
 
     files = find_source_files(source_dir)
     if not files:
-        print(f"No C/C++ source files found in {source_dir}")
+        print(f"No C/C++ source files found in {source_dir}", flush=True)
         return result
 
     result.files_scanned = len(files)
-    print(f"\nFound {len(files)} source files in {source_dir}")
+    print(f"\nSession: {session_id}", flush=True)
+    print(f"Session dir: {session_dir}", flush=True)
+    print(f"\nFound {len(files)} source files in {source_dir}", flush=True)
 
     # ── Stage 1: Triage ──
-    print(f"\n{'='*60}")
-    print(f"TRIAGE ({triage_backend})")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"TRIAGE ({triage_backend})", flush=True)
+    print(f"{'='*60}", flush=True)
 
-    triage_findings = run_scan_stage(files, triage_backend, "triage", source_dir)
+    run_scan_stage(files, triage_backend, "triage", source_dir, session_dir)
+    triage_findings = load_stage_findings(session_dir, "triage")
 
     if not triage_findings:
-        print("\nTriage: All files clean.")
+        print("\nTriage: All files clean.", flush=True)
         result.clean_files = [str(f.relative_to(source_dir)) for f in files]
         return result
 
@@ -637,39 +789,46 @@ def run_pipeline(args) -> ScanResult:
         for f in files
         if str(f.relative_to(source_dir)) not in flagged_files
     ]
-    print(f"\nTriage: {len(triage_findings)} findings in {len(flagged_files)} files")
+    print(
+        f"\nTriage: {len(triage_findings)} findings in {len(flagged_files)} files",
+        flush=True,
+    )
 
     if args.triage_only:
         result.findings = triage_findings
         return result
 
     # ── Stage 2: Reasoning ──
-    print(f"\n{'='*60}")
-    print(f"REASONING ({reasoning_backend})")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"REASONING ({reasoning_backend})", flush=True)
+    print(f"{'='*60}", flush=True)
 
     flagged_paths = [f for f in files if str(f.relative_to(source_dir)) in flagged_files]
-    reasoning_findings = run_scan_stage(
-        flagged_paths, reasoning_backend, "reasoning", source_dir
+    run_scan_stage(
+        flagged_paths, reasoning_backend, "reasoning", source_dir, session_dir
     )
+    reasoning_findings = load_stage_findings(session_dir, "reasoning")
 
     all_findings = triage_findings + reasoning_findings
     consensus = compute_consensus(all_findings)
 
     confirmed_count = sum(1 for c in consensus if c["count"] > 1)
-    print(f"\nReasoning: {len(reasoning_findings)} findings")
-    print(f"Consensus: {len(consensus)} unique, {confirmed_count} confirmed by both")
+    print(f"\nReasoning: {len(reasoning_findings)} findings", flush=True)
+    print(
+        f"Consensus: {len(consensus)} unique, {confirmed_count} confirmed by both",
+        flush=True,
+    )
 
     if not verdict_backend:
         result.findings = [f for group in consensus for f in group["findings"]]
         return result
 
     # ── Stage 3: Verdict ──
-    print(f"\n{'='*60}")
-    print(f"VERDICT ({verdict_backend})")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"VERDICT ({verdict_backend})", flush=True)
+    print(f"{'='*60}", flush=True)
 
-    consensus = run_verdict_stage(consensus, verdict_backend, source_dir)
+    consensus = run_verdict_stage(consensus, verdict_backend, source_dir, session_dir)
 
     # Filter: keep only confirmed findings
     for group in consensus:
@@ -686,6 +845,9 @@ def generate_report(result: ScanResult, output_path: str):
     """Generate a markdown report."""
     lines = [
         f"# {result.package} Security Scan Report\n",
+        f"**Date**: {result.created_at}",
+        f"**Session UUID**: {result.session_id}",
+        f"**Session Dir**: {result.session_dir}",
         f"**Files scanned**: {result.files_scanned}",
         f"**Files with findings**: {result.files_with_findings}",
         f"**Total findings**: {len(result.findings)}\n",
@@ -711,7 +873,7 @@ def generate_report(result: ScanResult, output_path: str):
     report = "\n".join(lines)
     with open(output_path, "w") as f:
         f.write(report)
-    print(f"\nReport written to {output_path}")
+    print(f"\nReport written to {output_path}", flush=True)
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────
@@ -740,6 +902,8 @@ Backend spec format: backend/model[@url]
     parser.add_argument("--package-name", help="Override auto-detected package name")
     parser.add_argument("--output", default="report.md", help="Output report path")
     parser.add_argument("--json", default=None, help="JSON output path")
+    parser.add_argument("--scratch-dir", default="/tmp/opensuse-security-scanner",
+                        help="Scratch root for per-run session directories")
 
     # Stage configuration
     parser.add_argument("--triage", default="ollama/gpt-oss-20b",
@@ -762,12 +926,15 @@ Backend spec format: backend/model[@url]
         with open(args.json, "w") as f:
             json.dump({
                 "package": result.package,
+                "session_id": result.session_id,
+                "session_dir": result.session_dir,
+                "created_at": result.created_at,
                 "files_scanned": result.files_scanned,
                 "findings": [asdict(f) for f in result.findings],
                 "clean_files": result.clean_files,
                 "errors": result.errors,
             }, f, indent=2)
-        print(f"JSON written to {args.json}")
+        print(f"JSON written to {args.json}", flush=True)
 
 
 if __name__ == "__main__":
