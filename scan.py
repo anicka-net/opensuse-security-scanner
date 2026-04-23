@@ -1868,7 +1868,8 @@ def load_progress_entries(session_dir: Path) -> List[dict]:
 def compute_stage_stats(session_dir: Path) -> dict:
     """Summarize persisted progress by stage."""
     stats = {}
-    for stage in ("triage", "triage_catchup", "reasoning", "verdict"):
+    for stage in ("triage", "triage_catchup", "triage_confirm",
+                  "triage_confirm_callers", "reasoning", "verdict"):
         entries = [e for e in load_progress_entries(session_dir) if e["stage"] == stage]
         stats[stage] = {
             "completed_files": len(entries),
@@ -2187,6 +2188,287 @@ def run_function_level_triage(files: List[SourceFile], backend: Backend,
         save_stage_file_output(session_dir, stage_name, backend, relpath, chunk_records)
 
 
+# ── Confirmation passes (2 and 3) ──────────────────────────────────────
+
+CONFIRMATION_PROMPT = """A previous function-level scan of this file \
+flagged the following potential vulnerability:
+
+FINDING:
+SEVERITY: {severity}
+LOCATION: {location}
+TYPE: {type}
+DESCRIPTION: {description}
+
+Now I'm showing you the WHOLE file. Re-evaluate the finding given this
+broader context. Ask yourself:
+
+1. Is the flagged code reachable with attacker-controlled input given
+   the rest of the file?
+2. Do preconditions elsewhere in the file rule out the exploit?
+3. Can you describe a concrete trigger from something visible in this file?
+
+If you need to see callers from OTHER files to judge exploitability,
+respond with NEED_CALLERS and specify which function(s) whose callers
+you need to see.
+
+Respond in this exact format (no other text):
+
+OUTCOME: CONFIRMED | FALSE_POSITIVE | NEED_CALLERS
+REASONING: <why — be specific about the path from input to sink, or
+            what rules out exploitation>
+CALLERS_OF: <comma-separated function names, only if NEED_CALLERS>
+
+Source file:
+```
+{code}
+```"""
+
+
+CALLER_PROMPT = """You previously flagged a vulnerability and said you
+needed to see callers from other files to judge exploitability:
+
+FINDING:
+SEVERITY: {severity}
+LOCATION: {location}
+TYPE: {type}
+DESCRIPTION: {description}
+
+PREVIOUS REASONING: {reasoning}
+
+Here are call sites found in other files for the function(s) you asked about:
+
+{callers}
+
+Given these callers, finalize your evaluation:
+
+OUTCOME: CONFIRMED | FALSE_POSITIVE
+REASONING: <why — trace from the callers' untrusted input to the sink>
+"""
+
+
+def _parse_confirmation_outcome(raw: str) -> dict:
+    """Parse OUTCOME / REASONING / CALLERS_OF lines from a confirmation response."""
+    outcome_m = re.search(
+        r"OUTCOME:\s*(CONFIRMED|FALSE_POSITIVE|NEED_CALLERS)",
+        raw,
+    )
+    outcome = outcome_m.group(1) if outcome_m else "UNPARSED"
+    # REASONING is everything after REASONING: up to CALLERS_OF: or EOF
+    reason_m = re.search(
+        r"REASONING:\s*(.+?)(?=\n\s*CALLERS_OF:|\Z)",
+        raw, re.DOTALL,
+    )
+    reasoning = reason_m.group(1).strip() if reason_m else ""
+    callers_m = re.search(r"CALLERS_OF:\s*(.+?)(?:\n|$)", raw)
+    callers_of = callers_m.group(1).strip() if callers_m else ""
+    return {
+        "outcome": outcome,
+        "reasoning": reasoning,
+        "callers_of": callers_of,
+        "raw": raw,
+    }
+
+
+def run_confirmation_pass(catchup_findings: List[Finding],
+                          files: List[SourceFile],
+                          backend: Backend,
+                          source_dir: str,
+                          session_dir: Path) -> Dict[str, dict]:
+    """Whole-file confirmation pass (pass 2) for catch-up findings.
+
+    For each finding from function-level catch-up, re-send the finding
+    plus the whole file and ask whether it holds up in the broader
+    context.  Saves one JSON per file to session_dir/triage_confirm/.
+
+    Returns a dict keyed by finding.key() mapping to the parsed
+    outcome (outcome, reasoning, callers_of, raw).
+    """
+    stage_name = "triage_confirm"
+    (session_dir / stage_name).mkdir(exist_ok=True)
+    file_by_relpath = {str(sf.path.relative_to(source_dir)): sf for sf in files}
+
+    # Group findings by file
+    by_file: Dict[str, List[Finding]] = {}
+    for f in catchup_findings:
+        by_file.setdefault(f.file, []).append(f)
+
+    results: Dict[str, dict] = {}
+
+    for i, (relpath, file_findings) in enumerate(sorted(by_file.items())):
+        record_path = session_dir / stage_name / f"{relpath}.json"
+        if record_path.exists():
+            payload = load_json(record_path)
+            for ev in payload.get("evaluations", []):
+                results[ev["finding_key"]] = ev
+            print(f"  [{i+1}/{len(by_file)}] {relpath} (cached)", flush=True)
+            continue
+
+        source_file = file_by_relpath.get(relpath)
+        if source_file is None:
+            continue
+
+        code = source_file.path.read_text(errors="replace")
+        # Cap to avoid blowing context
+        if len(code) > 40000:
+            code = code[:40000] + "\n\n// ... [file truncated]"
+
+        print(
+            f"  [{i+1}/{len(by_file)}] {relpath} ({len(file_findings)} finding(s))",
+            flush=True,
+        )
+
+        evaluations = []
+        for finding in file_findings:
+            prompt = CONFIRMATION_PROMPT.format(
+                severity=finding.severity,
+                location=finding.location,
+                type=finding.type,
+                description=finding.description,
+                code=code,
+            )
+            raw = backend.query("", prompt)
+            if not raw or not raw.strip():
+                raw = backend.query("", prompt)
+                if not raw or not raw.strip():
+                    raw = "[ERROR: empty response from model after retry]"
+            parsed = _parse_confirmation_outcome(raw)
+            parsed["finding_key"] = finding.key()
+            evaluations.append(parsed)
+            results[finding.key()] = parsed
+            print(f"    -> {parsed['outcome']}: {finding.location}", flush=True)
+
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(record_path, {
+            "file": relpath,
+            "stage": stage_name,
+            "backend": repr(backend),
+            "created_at": utc_now(),
+            "evaluations": evaluations,
+        })
+        append_jsonl(
+            session_dir / "progress.jsonl",
+            {
+                "created_at": utc_now(),
+                "stage": stage_name,
+                "file": relpath,
+                "backend": repr(backend),
+                "chunk_count": len(evaluations),
+                "finding_count": sum(1 for e in evaluations
+                                     if e["outcome"] == "CONFIRMED"),
+            },
+        )
+
+    return results
+
+
+def run_caller_pass(catchup_findings: List[Finding],
+                    confirmation_results: Dict[str, dict],
+                    backend: Backend,
+                    source_dir: str,
+                    session_dir: Path) -> Dict[str, dict]:
+    """Caller-context pass (pass 3) for findings that asked for callers.
+
+    For each catch-up finding whose confirmation said NEED_CALLERS,
+    use find_cross_references to pull call sites from other files and
+    ask the model to finalize its verdict.  Saves per-file JSON to
+    session_dir/triage_confirm_callers/.
+
+    Returns a dict keyed by finding.key() with updated outcomes.
+    """
+    stage_name = "triage_confirm_callers"
+
+    # Filter to findings with NEED_CALLERS outcome
+    needs = [
+        f for f in catchup_findings
+        if confirmation_results.get(f.key(), {}).get("outcome") == "NEED_CALLERS"
+    ]
+    if not needs:
+        return {}
+
+    (session_dir / stage_name).mkdir(exist_ok=True)
+    by_file: Dict[str, List[Finding]] = {}
+    for f in needs:
+        by_file.setdefault(f.file, []).append(f)
+
+    results: Dict[str, dict] = {}
+
+    for i, (relpath, file_findings) in enumerate(sorted(by_file.items())):
+        record_path = session_dir / stage_name / f"{relpath}.json"
+        if record_path.exists():
+            payload = load_json(record_path)
+            for ev in payload.get("evaluations", []):
+                results[ev["finding_key"]] = ev
+            print(f"  [{i+1}/{len(by_file)}] {relpath} (cached)", flush=True)
+            continue
+
+        print(
+            f"  [{i+1}/{len(by_file)}] {relpath} ({len(file_findings)} finding(s))",
+            flush=True,
+        )
+
+        evaluations = []
+        for finding in file_findings:
+            prior = confirmation_results.get(finding.key(), {})
+            callers = find_cross_references(finding, source_dir, finding.file)
+            if not callers:
+                callers = "(no call sites found in other files)"
+            prompt = CALLER_PROMPT.format(
+                severity=finding.severity,
+                location=finding.location,
+                type=finding.type,
+                description=finding.description,
+                reasoning=prior.get("reasoning", ""),
+                callers=callers,
+            )
+            raw = backend.query("", prompt)
+            if not raw or not raw.strip():
+                raw = backend.query("", prompt)
+                if not raw or not raw.strip():
+                    raw = "[ERROR: empty response from model after retry]"
+            parsed = _parse_confirmation_outcome(raw)
+            parsed["finding_key"] = finding.key()
+            evaluations.append(parsed)
+            results[finding.key()] = parsed
+            print(f"    -> {parsed['outcome']}: {finding.location}", flush=True)
+
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(record_path, {
+            "file": relpath,
+            "stage": stage_name,
+            "backend": repr(backend),
+            "created_at": utc_now(),
+            "evaluations": evaluations,
+        })
+        append_jsonl(
+            session_dir / "progress.jsonl",
+            {
+                "created_at": utc_now(),
+                "stage": stage_name,
+                "file": relpath,
+                "backend": repr(backend),
+                "chunk_count": len(evaluations),
+                "finding_count": sum(1 for e in evaluations
+                                     if e["outcome"] == "CONFIRMED"),
+            },
+        )
+
+    return results
+
+
+def load_confirmation_results(session_dir: Path,
+                              stage_name: str = "triage_confirm") -> Dict[str, dict]:
+    """Load all confirmation evaluations from a session stage."""
+    results: Dict[str, dict] = {}
+    stage_dir = session_dir / stage_name
+    if not stage_dir.exists():
+        return results
+    for path in sorted(stage_dir.rglob("*.json")):
+        payload = load_json(path)
+        for ev in payload.get("evaluations", []):
+            results[ev["finding_key"]] = ev
+    return results
+
+
 def find_cross_references(finding: Finding, source_dir: str,
                           finding_file: str) -> str:
     """Find likely cross-file references for the flagged symbol.
@@ -2305,6 +2587,10 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
                       source_dir: str, session_dir: Path,
                       profile_by_file: dict) -> List[dict]:
     """Run verdict stage: verify findings against source code."""
+    # Load any confirmation-pass outputs so we can show them to verdict
+    confirm_results = load_confirmation_results(session_dir, "triage_confirm")
+    caller_results = load_confirmation_results(session_dir, "triage_confirm_callers")
+
     for group in consensus:
         filepath = Path(source_dir) / group["findings"][0].file
         profile = profile_by_file[group["findings"][0].file]
@@ -2334,20 +2620,46 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
         reasoning_items = [f for f in group["findings"] if f.stage == "reasoning"]
         consensus_note, hypothesis_note = build_verdict_group_notes(group)
 
+        # Collect confirmation-pass notes for findings in this group
+        confirm_notes = []
+        for f in group["findings"]:
+            ev = confirm_results.get(f.key())
+            if ev:
+                note = (f"Confirmation pass (whole-file): {ev['outcome']}\n"
+                        f"  Reasoning: {ev['reasoning']}")
+                confirm_notes.append(note)
+            ev_caller = caller_results.get(f.key())
+            if ev_caller:
+                note = (f"Caller-context pass: {ev_caller['outcome']}\n"
+                        f"  Reasoning: {ev_caller['reasoning']}")
+                confirm_notes.append(note)
+
+        aux_section = ""
+        if xrefs:
+            aux_section += (
+                "\n\n// === Auxiliary cross-file reference hints ===\n"
+                "// The following section is heuristic context from other files.\n"
+                "// It is not part of the source file above and it is not a verified call graph.\n"
+                f"{xrefs}\n"
+                "// === End auxiliary cross-file reference hints ===\n"
+            )
+        if confirm_notes:
+            aux_section += (
+                "\n\n// === Prior confirmation pass notes ===\n"
+                "// The triage model was asked to re-evaluate its function-level\n"
+                "// findings against the whole file (and cross-file callers where\n"
+                "// requested).  Treat this as prior analysis, not ground truth.\n"
+                + "\n\n".join(confirm_notes) +
+                "\n// === End confirmation pass notes ===\n"
+            )
+
         prompt = profile.verdict_prompt_template.format(
             filename=group["findings"][0].file,
             triage_findings=format_findings_for_verdict(triage_items),
             reasoning_findings=format_findings_for_verdict(reasoning_items),
             consensus_note=consensus_note,
             hypothesis_note=hypothesis_note,
-            code=code + (
-                "\n\n// === Auxiliary cross-file reference hints ===\n"
-                "// The following section is heuristic context from other files.\n"
-                "// It is not part of the source file above and it is not a verified call graph.\n"
-                f"{xrefs}\n"
-                "// === End auxiliary cross-file reference hints ===\n"
-                if xrefs else ""
-            ),
+            code=code + aux_section,
         )
         raw = backend.query("", prompt)
         group["verdict_raw"] = raw
@@ -2555,7 +2867,6 @@ def run_pipeline(args) -> ScanResult:
         # Re-tag as "triage" so they count in cross-stage consensus
         for f in catchup_findings:
             f.stage = "triage"
-        triage_findings = triage_findings + catchup_findings
         if catchup_findings:
             catchup_files = {f.file for f in catchup_findings}
             print(
@@ -2565,6 +2876,47 @@ def run_pipeline(args) -> ScanResult:
             )
         else:
             print("\nCatch-up: no additional findings.", flush=True)
+
+        # ── Stage 1c: Confirmation pass (whole-file) ──
+        # For each catch-up finding, re-ask with the whole file as context.
+        # The model may ask for callers — if so, we run pass 3.
+        if catchup_findings:
+            print(f"\n{'='*60}", flush=True)
+            print(f"CONFIRMATION (whole-file, {reasoning_backend})", flush=True)
+            print(f"  Re-evaluating {len(catchup_findings)} catch-up finding(s) "
+                  f"with full file context", flush=True)
+            print(f"{'='*60}", flush=True)
+
+            confirmation = run_confirmation_pass(
+                catchup_findings, files, reasoning_backend,
+                source_dir, session_dir,
+            )
+            n_need_callers = sum(1 for v in confirmation.values()
+                                 if v["outcome"] == "NEED_CALLERS")
+            if n_need_callers:
+                print(f"\n{'='*60}", flush=True)
+                print(f"CALLER CONTEXT PASS ({reasoning_backend})", flush=True)
+                print(f"  {n_need_callers} finding(s) need cross-file callers",
+                      flush=True)
+                print(f"{'='*60}", flush=True)
+                caller_results = run_caller_pass(
+                    catchup_findings, confirmation, reasoning_backend,
+                    source_dir, session_dir,
+                )
+                # Caller-pass outcomes override confirmation outcomes
+                confirmation = {**confirmation, **caller_results}
+
+            n_confirmed = sum(1 for v in confirmation.values()
+                              if v["outcome"] == "CONFIRMED")
+            n_fp = sum(1 for v in confirmation.values()
+                       if v["outcome"] == "FALSE_POSITIVE")
+            print(
+                f"\nConfirmation: {n_confirmed} confirmed, {n_fp} FP, "
+                f"{len(confirmation) - n_confirmed - n_fp} ambiguous",
+                flush=True,
+            )
+
+        triage_findings = triage_findings + catchup_findings
 
     # ── Stage 2: Reasoning ──
     print(f"\n{'='*60}", flush=True)
@@ -2645,11 +2997,16 @@ def generate_report(result: ScanResult, output_path: str):
     if result.stage_stats:
         lines.append("## Scan funnel\n")
         lines.append(f"- **Files scanned**: {result.files_scanned}")
-        for stage in ("triage", "triage_catchup", "reasoning", "verdict"):
+        for stage in ("triage", "triage_catchup", "triage_confirm",
+                  "triage_confirm_callers", "reasoning", "verdict"):
             stats = result.stage_stats.get(stage)
             if not stats or not stats.get("completed_files"):
                 continue
-            label = "Triage catch-up" if stage == "triage_catchup" else stage.capitalize()
+            label = {
+                "triage_catchup": "Triage catch-up",
+                "triage_confirm": "Confirmation (whole-file)",
+                "triage_confirm_callers": "Confirmation (callers)",
+            }.get(stage, stage.capitalize())
             lines.append(
                 f"- **{label}**: {stats['completed_files']} files, "
                 f"{stats['files_with_findings']} with findings, "

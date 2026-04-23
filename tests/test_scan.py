@@ -1617,3 +1617,214 @@ def test_extract_functions_survives_crash_in_extractor(monkeypatch):
     monkeypatch.setitem(scan.FUNCTION_EXTRACTORS, "c_cpp", boom)
     # Should not raise — returns empty for caller to fall back
     assert scan.extract_functions("anything", "c_cpp") == []
+
+
+# ── Confirmation pass tests ──────────────────────────────────────────
+
+
+def test_parse_confirmation_outcome_confirmed():
+    raw = (
+        "OUTCOME: CONFIRMED\n"
+        "REASONING: attacker controls len via config file; overflow reachable"
+    )
+    result = scan._parse_confirmation_outcome(raw)
+    assert result["outcome"] == "CONFIRMED"
+    assert "attacker controls len" in result["reasoning"]
+    assert result["callers_of"] == ""
+
+
+def test_parse_confirmation_outcome_false_positive():
+    raw = (
+        "OUTCOME: FALSE_POSITIVE\n"
+        "REASONING: the caller always passes a literal constant — not reachable"
+    )
+    result = scan._parse_confirmation_outcome(raw)
+    assert result["outcome"] == "FALSE_POSITIVE"
+    assert "literal constant" in result["reasoning"]
+
+
+def test_parse_confirmation_outcome_need_callers():
+    raw = (
+        "OUTCOME: NEED_CALLERS\n"
+        "REASONING: the function is not called anywhere in this file\n"
+        "CALLERS_OF: verify_password, check_auth"
+    )
+    result = scan._parse_confirmation_outcome(raw)
+    assert result["outcome"] == "NEED_CALLERS"
+    assert result["callers_of"] == "verify_password, check_auth"
+
+
+def test_parse_confirmation_outcome_unparsed():
+    raw = "I think this looks suspicious."
+    result = scan._parse_confirmation_outcome(raw)
+    assert result["outcome"] == "UNPARSED"
+
+
+def test_run_confirmation_pass_saves_results(tmp_path):
+    """Confirmation pass writes JSON per file and returns parsed outcomes."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "foo.c").write_text("int main() { return 0; }\n")
+
+    session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "pkg")
+
+    finding = scan.Finding(
+        severity="High", location="main()", type="overflow",
+        description="catch-up flagged this",
+        exploitation="", file="foo.c",
+        model="test", stage="triage",
+    )
+
+    class ConfirmBackend(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            return (
+                "OUTCOME: CONFIRMED\n"
+                "REASONING: verified against whole file"
+            )
+        def __repr__(self):
+            return "test/confirm"
+
+    source_file = scan.SourceFile(source_dir / "foo.c", scan.load_profile("c_cpp"))
+    results = scan.run_confirmation_pass(
+        [finding], [source_file], ConfirmBackend(),
+        str(source_dir), session_dir,
+    )
+
+    assert finding.key() in results
+    assert results[finding.key()]["outcome"] == "CONFIRMED"
+    # Per-file JSON exists
+    assert (session_dir / "triage_confirm" / "foo.c.json").exists()
+
+
+def test_run_confirmation_pass_triggers_caller_pass(tmp_path):
+    """When confirmation says NEED_CALLERS, caller pass runs with xrefs."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "lib.c").write_text("void target(char *p) { }\n")
+    (source_dir / "caller.c").write_text('int main() { target("hello"); }\n')
+
+    session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "pkg")
+
+    finding = scan.Finding(
+        severity="High", location="target", type="overflow",
+        description="catch-up finding",
+        exploitation="", file="lib.c",
+        model="test", stage="triage",
+    )
+
+    class SwitchBackend(scan.Backend):
+        def __init__(self):
+            self.call_count = 0
+        def query(self, system, user, max_tokens=16384):
+            self.call_count += 1
+            if self.call_count == 1:
+                # First call = confirmation pass — ask for callers
+                return (
+                    "OUTCOME: NEED_CALLERS\n"
+                    "REASONING: not called in this file\n"
+                    "CALLERS_OF: target"
+                )
+            # Second call = caller pass — confirm
+            return (
+                "OUTCOME: CONFIRMED\n"
+                "REASONING: caller passes attacker input"
+            )
+        def __repr__(self):
+            return "test/switch"
+
+    backend = SwitchBackend()
+    source_files = [
+        scan.SourceFile(source_dir / "lib.c", scan.load_profile("c_cpp")),
+        scan.SourceFile(source_dir / "caller.c", scan.load_profile("c_cpp")),
+    ]
+
+    confirm = scan.run_confirmation_pass(
+        [finding], source_files, backend, str(source_dir), session_dir,
+    )
+    assert confirm[finding.key()]["outcome"] == "NEED_CALLERS"
+
+    caller_res = scan.run_caller_pass(
+        [finding], confirm, backend, str(source_dir), session_dir,
+    )
+    assert caller_res[finding.key()]["outcome"] == "CONFIRMED"
+    assert (session_dir / "triage_confirm_callers" / "lib.c.json").exists()
+
+
+def test_run_caller_pass_skips_findings_without_need_callers(tmp_path):
+    """Findings whose confirmation was CONFIRMED/FP are not re-asked."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "foo.c").write_text("void x() {}\n")
+    session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "pkg")
+
+    finding = scan.Finding(
+        severity="High", location="x", type="overflow", description="",
+        exploitation="", file="foo.c", model="test", stage="triage",
+    )
+    confirmation = {finding.key(): {"outcome": "CONFIRMED", "reasoning": "ok"}}
+
+    class ShouldNotCallBackend(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            raise RuntimeError("caller pass should not run")
+        def __repr__(self):
+            return "test/nope"
+
+    result = scan.run_caller_pass(
+        [finding], confirmation, ShouldNotCallBackend(),
+        str(source_dir), session_dir,
+    )
+    assert result == {}
+
+
+def test_verdict_prompt_includes_confirmation_notes(tmp_path, monkeypatch):
+    """Verdict prompt sees confirmation-pass reasoning when present."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "foo.c").write_text("int main() { return 0; }\n")
+    session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "pkg")
+
+    # Seed a confirmation output
+    (session_dir / "triage_confirm").mkdir(parents=True, exist_ok=True)
+    scan.write_json(
+        session_dir / "triage_confirm" / "foo.c.json",
+        {
+            "file": "foo.c",
+            "stage": "triage_confirm",
+            "backend": "test",
+            "created_at": "2026-04-23T00:00:00+00:00",
+            "evaluations": [
+                {
+                    "finding_key": "foo.c:main():overflow",
+                    "outcome": "CONFIRMED",
+                    "reasoning": "confirmation REASONING MARKER",
+                    "callers_of": "",
+                }
+            ],
+        },
+    )
+
+    prompts_sent = []
+
+    class CapturingBackend(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            prompts_sent.append(user)
+            return "VERDICT: CONFIRMED\nREAL_SEVERITY: High\nREASONING: ok"
+        def __repr__(self):
+            return "test/verdict"
+
+    finding = scan.Finding(
+        severity="High", location="main()", type="overflow",
+        description="x", exploitation="", file="foo.c",
+        model="test", stage="triage",
+    )
+    consensus = [{"findings": [finding], "stages": {"triage"}, "count": 1}]
+    profile_by_file = {"foo.c": scan.load_profile("c_cpp")}
+
+    scan.run_verdict_stage(
+        consensus, CapturingBackend(), str(source_dir),
+        session_dir, profile_by_file,
+    )
+    assert prompts_sent
+    joined = "\n".join(prompts_sent)
+    assert "confirmation REASONING MARKER" in joined
+    assert "Prior confirmation pass notes" in joined
