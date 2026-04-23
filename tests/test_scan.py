@@ -1189,3 +1189,86 @@ def test_pipeline_forwards_failed_triage_to_reasoning(tmp_path, monkeypatch):
     assert "small.c" not in reasoning_be.seen_files
     # The reasoning finding should be in results
     assert any(f.file == "big.c" for f in result.findings)
+
+
+def test_find_chunked_files(tmp_path):
+    """Files that needed chunking are detected."""
+    session_id, session_dir = scan.make_session_dir(str(tmp_path), "pkg")
+
+    # Single-chunk file
+    scan.save_stage_file_output(session_dir, "triage", FakeBackend("test"), "small.c", [
+        {"chunk_index": 1, "label": "small.c", "raw_output": "CLEAN", "findings": []},
+    ])
+
+    # Multi-chunk file — clean but was chunked
+    scan.save_stage_file_output(session_dir, "triage", FakeBackend("test"), "big.c", [
+        {"chunk_index": 1, "label": "big.c (part 1/2)", "raw_output": "CLEAN", "findings": []},
+        {"chunk_index": 2, "label": "big.c (part 2/2)", "raw_output": "CLEAN", "findings": []},
+    ])
+
+    chunked = scan.find_chunked_files(session_dir, "triage")
+    assert chunked == ["big.c"]
+
+
+def test_pipeline_forwards_chunked_clean_files_to_reasoning(tmp_path, monkeypatch):
+    """Clean files that were chunked in triage get forwarded to reasoning."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    # Write a file large enough to be chunked at 200 chars
+    (source_dir / "big.c").write_text("int x;\n" * 100)
+    (source_dir / "small.c").write_text("int ok() { return 0; }\n")
+
+    call_log = {"triage": [], "reasoning": []}
+
+    class SmallContextTriage(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            label = user.splitlines()[0].removeprefix("SOURCE FILE: ")
+            filename = label.split(" (part ", 1)[0]
+            call_log["triage"].append(filename)
+            return "CLEAN"
+
+        def __repr__(self):
+            return "test/triage"
+
+    class ReasoningBE(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            label = user.splitlines()[0].removeprefix("SOURCE FILE: ")
+            filename = label.split(" (part ", 1)[0]
+            call_log["reasoning"].append(filename)
+            return make_finding_text("x", "overflow", "found by reasoning")
+
+        def __repr__(self):
+            return "test/reasoning"
+
+    backends = {
+        "test/triage": SmallContextTriage(),
+        "test/reasoning": ReasoningBE(),
+    }
+    monkeypatch.setattr(scan, "parse_backend_spec", lambda spec: backends[spec])
+    # Force chunking at 200 chars so big.c gets chunked
+    monkeypatch.setattr(scan, "chunk_file", lambda code, max_chars=40000: (
+        scan.chunk_file.__wrapped__(code, max_chars=200)
+        if hasattr(scan.chunk_file, '__wrapped__')
+        else [code[i:i+200] for i in range(0, len(code), 200)] if len(code) > 200 else [code]
+    ))
+
+    args = Namespace(
+        source_dir=str(source_dir),
+        obs_package=None,
+        package_name="pkg",
+        output=str(tmp_path / "report.md"),
+        json=None,
+        scratch_dir=str(tmp_path / "scratch"),
+        profile="c_cpp",
+        triage="test/triage",
+        reasoning="test/reasoning",
+        verdict=None,
+        triage_only=False,
+    )
+
+    result = scan.run_pipeline(args)
+
+    # big.c was clean in triage but chunked — should be forwarded to reasoning
+    assert "big.c" in call_log["reasoning"]
+    # small.c was clean and not chunked — should NOT go to reasoning
+    assert "small.c" not in call_log["reasoning"]

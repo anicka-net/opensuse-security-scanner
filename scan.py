@@ -1110,6 +1110,22 @@ def find_failed_files(session_dir: Path, stage_name: str) -> List[str]:
     return failed
 
 
+def find_chunked_files(session_dir: Path, stage_name: str) -> List[str]:
+    """Find files that were split into multiple chunks for a stage.
+
+    Chunked files lose cross-function context and may miss
+    vulnerabilities that span multiple parts of the file.  These
+    should be forwarded to the next stage even when clean, because
+    a larger-context model may catch what the chunks missed.
+    """
+    chunked = []
+    for path in sorted((session_dir / stage_name).rglob("*.json")):
+        payload = load_json(path)
+        if payload.get("chunk_count", 1) > 1:
+            chunked.append(payload["file"])
+    return chunked
+
+
 def load_progress_entries(session_dir: Path) -> List[dict]:
     """Load progress events from the session directory."""
     path = session_dir / "progress.jsonl"
@@ -1673,20 +1689,34 @@ def run_pipeline(args) -> ScanResult:
     # Detect files that failed triage entirely (context exceeded, etc.)
     # These must still go to reasoning — they weren't analyzed, not clean.
     triage_failed = set(find_failed_files(session_dir, "triage"))
-    if triage_failed:
+
+    # Files that were chunked lose cross-function context and may miss
+    # vulnerabilities.  Forward them to reasoning even if triage found
+    # nothing — the reasoning model typically has a larger context window.
+    triage_chunked = set(find_chunked_files(session_dir, "triage"))
+    # Only forward chunked files that weren't already flagged or failed
+    triage_extra = triage_chunked - {f.file for f in triage_findings} - triage_failed
+
+    triage_forwarded = triage_failed | triage_extra
+    if triage_forwarded:
+        parts = []
+        if triage_failed:
+            parts.append(f"{len(triage_failed)} failed")
+        if triage_extra:
+            parts.append(f"{len(triage_extra)} chunked-but-clean")
         print(
-            f"\n[WARN] {len(triage_failed)} file(s) failed triage "
-            f"(will forward to reasoning): {', '.join(sorted(triage_failed))}",
+            f"\n[WARN] {len(triage_forwarded)} file(s) forwarded to reasoning "
+            f"({', '.join(parts)}): {', '.join(sorted(triage_forwarded))}",
             flush=True,
         )
 
-    if not triage_findings and not triage_failed:
+    if not triage_findings and not triage_forwarded:
         print("\nTriage: All files clean.", flush=True)
         result.clean_files = [str(f.path.relative_to(source_dir)) for f in files]
         result.stage_stats = compute_stage_stats(session_dir)
         return result
 
-    flagged_files = {f.file for f in triage_findings} | triage_failed
+    flagged_files = {f.file for f in triage_findings} | triage_forwarded
     result.files_with_findings = len(flagged_files)
     result.clean_files = [
         str(f.path.relative_to(source_dir))
@@ -1695,8 +1725,8 @@ def run_pipeline(args) -> ScanResult:
     ]
     print(
         f"\nTriage: {len(triage_findings)} findings in "
-        f"{len(flagged_files - triage_failed)} files"
-        + (f" + {len(triage_failed)} failed file(s) forwarded" if triage_failed else ""),
+        f"{len(flagged_files - triage_forwarded)} files"
+        + (f" + {len(triage_forwarded)} forwarded" if triage_forwarded else ""),
         flush=True,
     )
 
