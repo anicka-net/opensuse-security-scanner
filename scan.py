@@ -428,6 +428,737 @@ def find_source_files(source_dir: str, profiles: List[Profile]) -> List[SourceFi
     return files
 
 
+def _strip_comments_and_strings(code: str) -> str:
+    """Replace comments and string literals with spaces, preserving newlines.
+
+    Used for reliable brace-depth tracking in C/C++ code.
+    """
+    result = []
+    i = 0
+    while i < len(code):
+        if code[i:i+2] == "//":
+            # Line comment — skip to end of line
+            while i < len(code) and code[i] != "\n":
+                result.append(" ")
+                i += 1
+        elif code[i:i+2] == "/*":
+            # Block comment — skip to */
+            result.append(" ")
+            result.append(" ")
+            i += 2
+            while i < len(code) and code[i:i+2] != "*/":
+                result.append("\n" if code[i] == "\n" else " ")
+                i += 1
+            if i < len(code):
+                result.append(" ")
+                result.append(" ")
+                i += 2
+        elif code[i] in ('"', "'"):
+            # String or char literal — skip to closing quote
+            quote = code[i]
+            result.append(" ")
+            i += 1
+            while i < len(code) and code[i] != quote:
+                if code[i] == "\\":
+                    result.append(" ")
+                    i += 1
+                result.append(" " if code[i] != "\n" else "\n")
+                i += 1
+            if i < len(code):
+                result.append(" ")
+                i += 1
+        else:
+            result.append(code[i])
+            i += 1
+    return "".join(result)
+
+
+# Regex for C/C++ function definitions at file scope.
+# Matches: optional qualifiers, return type, function name, parameter list, {
+# Must start at column 0 (or after leading whitespace that looks like file scope).
+_C_FUNC_DEF_RE = re.compile(
+    r'^(?:static\s+|inline\s+|extern\s+|__attribute__\S+\s+)*'  # qualifiers
+    r'(?:(?:const\s+|unsigned\s+|signed\s+|struct\s+|enum\s+|union\s+)*'
+    r'[a-zA-Z_]\w*(?:\s*\*)*)'  # return type
+    r'\s+'
+    r'([a-zA-Z_]\w*)'  # function name (capture group 1)
+    r'\s*\([^)]*\)',  # parameter list
+    re.MULTILINE,
+)
+
+
+def extract_c_functions(code: str) -> List[Tuple[str, str]]:
+    """Extract individual C/C++ functions from source code.
+
+    Returns a list of (function_name, function_code) tuples.
+    Prepends file-level declarations (structs, typedefs, macros) as
+    context for each function.
+    """
+    lines = code.split("\n")
+    clean = _strip_comments_and_strings(code)
+    clean_lines = clean.split("\n")
+    functions: List[Tuple[str, str]] = []
+    preamble_end = 0  # line index where first function starts
+
+    # Find function boundaries by tracking brace depth on cleaned code
+    depth = 0
+    in_function = False
+    func_start = 0
+    func_name = ""
+
+    for i, cline in enumerate(clean_lines):
+        if not in_function and depth == 0 and "{" in cline:
+            # At file scope with an opening brace — look back to see if
+            # the preceding lines form a function signature.  Walk back
+            # until we hit a statement terminator (; or }) or start of file,
+            # stopping at blank lines or preprocessor directives that break
+            # up declarations.
+            sig_start = i
+            for j in range(i - 1, max(-1, i - 30), -1):
+                prev = clean_lines[j].strip()
+                if not prev:
+                    # Blank line breaks the chain only if we already saw signature content
+                    if sig_start < i:
+                        break
+                    continue
+                if prev.endswith(";") or prev.endswith("}"):
+                    break
+                if prev.startswith("#"):
+                    # Preprocessor line — don't include, but don't break
+                    # (common to have #ifdef/#endif around attributes)
+                    continue
+                sig_start = j
+
+            # Collect signature lines and check for a function definition pattern
+            sig_joined = " ".join(
+                line for line in clean_lines[sig_start:i + 1]
+                if not line.strip().startswith("#")
+            )
+            m = _C_FUNC_DEF_RE.search(sig_joined)
+            if m:
+                name = m.group(1)
+                if name not in ("if", "while", "for", "switch", "do",
+                                "else", "return", "sizeof", "typeof",
+                                "defined"):
+                    in_function = True
+                    func_name = name
+                    # Also include preceding comment block as part of the function
+                    func_start = sig_start
+                    for k in range(sig_start - 1, -1, -1):
+                        line_k = lines[k].strip()
+                        if line_k.startswith("/*") or line_k.startswith("//"):
+                            func_start = k
+                        elif line_k.endswith("*/"):
+                            func_start = k
+                            # Walk up the comment block
+                            for kk in range(k - 1, -1, -1):
+                                if "/*" in lines[kk]:
+                                    func_start = kk
+                                    break
+                                if not lines[kk].strip() or "*" in lines[kk]:
+                                    func_start = kk
+                                else:
+                                    break
+                            break
+                        elif not line_k:
+                            continue
+                        else:
+                            break
+                    if preamble_end == 0:
+                        preamble_end = func_start
+
+        depth += cline.count("{") - cline.count("}")
+
+        if in_function and depth == 0:
+            func_body = "\n".join(lines[func_start:i + 1])
+            functions.append((func_name, func_body))
+            in_function = False
+
+    # Build preamble: everything before the first function (structs, typedefs, etc.)
+    preamble = "\n".join(lines[:preamble_end]).strip()
+    if len(preamble) > 3000:
+        preamble = preamble[:3000] + "\n// ... (preamble truncated)"
+
+    if preamble:
+        functions = [
+            (name, f"// File-level declarations for context:\n{preamble}\n\n"
+                   f"// Function under review:\n{body}")
+            for name, body in functions
+        ]
+
+    return functions
+
+
+# ── Python function extractor ──────────────────────────────────────────
+
+# Matches `def name(` or `async def name(` with any leading whitespace.
+_PY_DEF_RE = re.compile(r'^(\s*)(?:async\s+)?def\s+([a-zA-Z_]\w*)\s*\(', re.MULTILINE)
+
+
+def extract_python_functions(code: str) -> List[Tuple[str, str]]:
+    """Extract Python functions and methods.
+
+    Uses indentation to find function bodies.  Class methods are
+    qualified as ``ClassName.method``.  Preamble (imports, top-level
+    constants, class definitions) is prepended as context.
+    """
+    lines = code.split("\n")
+    functions: List[Tuple[str, str]] = []
+    # Find all function definitions and their indent levels
+    matches = []
+    class_stack: List[Tuple[int, str]] = []  # (indent, class_name)
+
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(stripped)
+        # Pop class stack when dedenting out
+        while class_stack and class_stack[-1][0] >= indent:
+            class_stack.pop()
+        # Track class declarations
+        class_m = re.match(r'class\s+([A-Za-z_]\w*)', stripped)
+        if class_m:
+            class_stack.append((indent, class_m.group(1)))
+            continue
+        # Track function declarations
+        def_m = re.match(r'(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(', stripped)
+        if def_m:
+            name = def_m.group(1)
+            if class_stack:
+                name = f"{class_stack[-1][1]}.{name}"
+            matches.append((i, indent, name))
+
+    preamble_end = matches[0][0] if matches else len(lines)
+
+    # Build preamble: everything before first function, plus class headers
+    preamble_parts = []
+    preamble_parts.extend(lines[:preamble_end])
+    preamble = "\n".join(preamble_parts).strip()
+    if len(preamble) > 3000:
+        preamble = preamble[:3000] + "\n# ... (preamble truncated)"
+
+    # Extract each function: from def line until indent drops back
+    for idx, (start, indent, name) in enumerate(matches):
+        # Find end: next line at indent <= function indent
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            line = lines[j]
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            line_indent = len(line) - len(stripped)
+            if line_indent <= indent:
+                end = j
+                break
+        # Include decorator lines immediately before
+        real_start = start
+        for k in range(start - 1, -1, -1):
+            line_k = lines[k].strip()
+            if line_k.startswith("@") or line_k == "":
+                real_start = k
+            else:
+                break
+        body = "\n".join(lines[real_start:end]).rstrip()
+        if preamble:
+            wrapped = (f"# File-level context:\n{preamble}\n\n"
+                       f"# Function under review:\n{body}")
+        else:
+            wrapped = body
+        functions.append((name, wrapped))
+
+    return functions
+
+
+# ── Bash function extractor ────────────────────────────────────────────
+
+# Matches `name() {` or `function name {` at line start.
+_BASH_FUNC_RE = re.compile(
+    r'^(?:function\s+([A-Za-z_][\w\-]*)\s*(?:\(\s*\))?\s*\{|'
+    r'([A-Za-z_][\w\-]*)\s*\(\s*\)\s*\{)',
+    re.MULTILINE,
+)
+
+
+def extract_bash_functions(code: str) -> List[Tuple[str, str]]:
+    """Extract Bash function definitions.
+
+    Handles both `name() { ... }` and `function name { ... }` forms.
+    Skips content inside heredocs and single/double-quoted strings for
+    brace counting.  Preamble is everything before the first function
+    (set -e, source lines, variable defs).
+    """
+    functions: List[Tuple[str, str]] = []
+    lines = code.split("\n")
+    # Build a cleaned version for brace counting: strip quoted strings only.
+    # (Bash strings are simpler than C — no /* */ comments.)
+    cleaned = []
+    i = 0
+    in_heredoc = False
+    heredoc_marker = ""
+    for line in lines:
+        s = line
+        if in_heredoc:
+            if line.strip() == heredoc_marker:
+                in_heredoc = False
+            cleaned.append("")  # hide heredoc contents
+            continue
+        # Detect heredoc start
+        hd = re.search(r"<<-?\s*['\"]?(\w+)['\"]?", line)
+        if hd:
+            heredoc_marker = hd.group(1)
+            in_heredoc = True
+        # Strip single-line comments
+        s = re.sub(r'(?<![\\$])#.*$', '', s)
+        # Strip double-quoted strings (preserve braces? No — drop them)
+        s = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', '""', s)
+        s = re.sub(r"'[^']*'", "''", s)
+        cleaned.append(s)
+
+    preamble_end = None
+    depth = 0
+    in_func = False
+    func_start = 0
+    func_name = ""
+
+    for i, line in enumerate(cleaned):
+        if not in_func:
+            m = _BASH_FUNC_RE.search(line)
+            if m:
+                func_name = m.group(1) or m.group(2)
+                func_start = i
+                in_func = True
+                depth = line.count("{") - line.count("}")
+                if preamble_end is None:
+                    preamble_end = i
+                if depth <= 0:
+                    # Single-line function (unusual but possible)
+                    body = lines[func_start]
+                    functions.append((func_name, body))
+                    in_func = False
+                continue
+        else:
+            depth += line.count("{") - line.count("}")
+            if depth <= 0:
+                body = "\n".join(lines[func_start:i + 1])
+                functions.append((func_name, body))
+                in_func = False
+
+    if preamble_end is None:
+        preamble_end = 0
+    preamble = "\n".join(lines[:preamble_end]).strip()
+    if len(preamble) > 3000:
+        preamble = preamble[:3000] + "\n# ... (preamble truncated)"
+
+    if preamble:
+        functions = [
+            (name, f"# File-level context:\n{preamble}\n\n"
+                   f"# Function under review:\n{body}")
+            for name, body in functions
+        ]
+
+    return functions
+
+
+# ── Rust function extractor ────────────────────────────────────────────
+
+# Matches fn definitions; handles pub/async/const/unsafe/extern qualifiers.
+_RUST_FN_RE = re.compile(
+    r'^(?:\s*)(?:pub(?:\([^)]*\))?\s+)?(?:const\s+|async\s+|unsafe\s+|'
+    r'extern\s+("[^"]*")?\s*)*fn\s+([A-Za-z_]\w*)',
+    re.MULTILINE,
+)
+
+
+def extract_rust_functions(code: str) -> List[Tuple[str, str]]:
+    """Extract Rust fn definitions.
+
+    Includes fns inside impl/trait blocks (qualified as Type::method).
+    Preamble: use statements, struct/enum/trait definitions.
+    """
+    functions: List[Tuple[str, str]] = []
+    lines = code.split("\n")
+    cleaned = _strip_comments_and_strings(code).split("\n")
+
+    # Track impl/trait context via brace depth
+    depth = 0
+    impl_stack: List[Tuple[int, str]] = []  # (depth_at_open, type_name)
+    in_fn = False
+    fn_start = 0
+    fn_name = ""
+    fn_depth_start = 0
+    preamble_end = None
+
+    # Pre-scan: find all `fn NAME` lines.  For each, walk forward to find
+    # the opening `{` (signature may span multiple lines with generics/args).
+    pending_fn: Optional[Tuple[int, str]] = None
+
+    for i, cline in enumerate(cleaned):
+        if not in_fn:
+            # Check impl/trait block start
+            impl_m = re.match(r'\s*impl(?:\s*<[^>]*>)?\s+(?:([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s+for\s+)?([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)(?:\s*<[^>]*>)?', cline)
+            if impl_m and "{" in cline:
+                type_name = impl_m.group(2)
+                impl_stack.append((depth, type_name))
+
+            # Did we find a `fn NAME` on this line? Remember it.
+            fn_m = _RUST_FN_RE.search(cline)
+            if fn_m:
+                name = fn_m.group(2)
+                if impl_stack:
+                    name = f"{impl_stack[-1][1]}::{name}"
+                # Could be a trait method declaration (no body, ends with `;`)
+                # or a real definition (eventually has `{`).  Hold it until
+                # we see either `;` or `{`.
+                pending_fn = (i, name)
+
+            if pending_fn is not None and "{" in cline:
+                fn_start_line, candidate_name = pending_fn
+                fn_name = candidate_name
+                fn_start = fn_start_line
+                fn_depth_start = depth
+                in_fn = True
+                pending_fn = None
+                if preamble_end is None:
+                    preamble_end = fn_start
+            elif pending_fn is not None and ";" in cline and "{" not in cline:
+                # trait method declaration without body — skip
+                pending_fn = None
+
+        depth += cline.count("{") - cline.count("}")
+
+        # Pop impl_stack when exiting
+        while impl_stack and depth <= impl_stack[-1][0]:
+            impl_stack.pop()
+
+        if in_fn and depth <= fn_depth_start:
+            body = "\n".join(lines[fn_start:i + 1])
+            functions.append((fn_name, body))
+            in_fn = False
+
+    if preamble_end is None:
+        preamble_end = 0
+    preamble = "\n".join(lines[:preamble_end]).strip()
+    if len(preamble) > 3000:
+        preamble = preamble[:3000] + "\n// ... (preamble truncated)"
+
+    if preamble:
+        functions = [
+            (name, f"// File-level context:\n{preamble}\n\n"
+                   f"// Function under review:\n{body}")
+            for name, body in functions
+        ]
+
+    return functions
+
+
+# ── Ruby function extractor ────────────────────────────────────────────
+
+_RUBY_DEF_RE = re.compile(r'^(\s*)def\s+((?:self\.)?[A-Za-z_]\w*[?!=]?)')
+
+
+def extract_ruby_functions(code: str) -> List[Tuple[str, str]]:
+    """Extract Ruby def blocks.
+
+    Handles nested defs inside class/module blocks, qualified as
+    Class#method.  Matches ``def ... end`` pairs via keyword tracking
+    (class/module/def/do/begin/if/while/case/unless open, end closes).
+    """
+    functions: List[Tuple[str, str]] = []
+    lines = code.split("\n")
+
+    # Build a token-stripped view to avoid matching 'end' inside strings
+    # (simplified — full Ruby string parsing is complex)
+    cleaned = []
+    for line in lines:
+        # Strip line comments
+        s = re.sub(r'(?<!\\)#.*$', '', line)
+        # Strip simple strings
+        s = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', '""', s)
+        s = re.sub(r"'[^'\\]*(?:\\.[^'\\]*)*'", "''", s)
+        cleaned.append(s)
+
+    class_stack: List[Tuple[int, str]] = []  # (depth_at_open, name)
+    depth = 0
+    in_def = False
+    def_start = 0
+    def_depth = 0
+    def_name = ""
+    preamble_end = None
+
+    # Keywords that open a block (require matching 'end')
+    # def, class, module, do, begin, if (at start of line), unless, while, until, case
+    # We only need to distinguish 'def' specifically; others just increment depth.
+    opener_re = re.compile(
+        r'(?:^|\s)(?:class|module|def|do|begin|if|unless|while|until|case)\b(?!\s*:)'
+    )
+    # Postfix `if`/`unless` don't increment — match only when at logical start
+    inline_opener_re = re.compile(r'\bdo\s*(?:\|[^|]*\|)?\s*$')
+
+    for i, cline in enumerate(cleaned):
+        stripped = cline.strip()
+        if not stripped:
+            continue
+
+        # Count block openers on this line
+        opens = 0
+        closes = len(re.findall(r'\bend\b', cline))
+
+        # Defs start a block
+        def_m = _RUBY_DEF_RE.match(cline)
+        if def_m:
+            opens += 1
+            if not in_def:
+                name = def_m.group(2)
+                if class_stack:
+                    sep = "." if name.startswith("self.") else "#"
+                    name = f"{class_stack[-1][1]}{sep}{name.removeprefix('self.')}"
+                def_name = name
+                def_start = i
+                def_depth = depth
+                in_def = True
+                if preamble_end is None:
+                    preamble_end = i
+
+        # Class/module
+        cls_m = re.match(r'\s*(?:class|module)\s+([A-Za-z_][\w:]*)', cline)
+        if cls_m and not in_def:
+            opens += 1
+            class_stack.append((depth, cls_m.group(1)))
+
+        # Other block openers (only at statement start, not postfix)
+        if re.match(r'\s*(?:begin|case)\b', cline):
+            opens += 1
+        if re.match(r'\s*(?:if|unless|while|until)\b', cline) and not re.search(r';\s*end\s*$', cline):
+            opens += 1
+        if inline_opener_re.search(cline):
+            opens += 1
+
+        depth += opens - closes
+
+        while class_stack and depth <= class_stack[-1][0]:
+            class_stack.pop()
+
+        if in_def and depth <= def_depth:
+            body = "\n".join(lines[def_start:i + 1])
+            functions.append((def_name, body))
+            in_def = False
+
+    if preamble_end is None:
+        preamble_end = 0
+    preamble = "\n".join(lines[:preamble_end]).strip()
+    if len(preamble) > 3000:
+        preamble = preamble[:3000] + "\n# ... (preamble truncated)"
+
+    if preamble:
+        functions = [
+            (name, f"# File-level context:\n{preamble}\n\n"
+                   f"# Function under review:\n{body}")
+            for name, body in functions
+        ]
+
+    return functions
+
+
+# ── Perl function extractor ────────────────────────────────────────────
+
+_PERL_SUB_RE = re.compile(
+    r'^\s*sub\s+([A-Za-z_]\w*)(?:\s*(?:\([^)]*\))?(?:\s*:\s*[A-Za-z_]\w*)*)?\s*\{',
+    re.MULTILINE,
+)
+
+
+def extract_perl_functions(code: str) -> List[Tuple[str, str]]:
+    """Extract Perl `sub` definitions.
+
+    Handles prototype syntax (``sub name ($$)``) and attributes.
+    Preamble: use statements, package declarations, global vars.
+    """
+    functions: List[Tuple[str, str]] = []
+    lines = code.split("\n")
+
+    cleaned = []
+    for line in lines:
+        s = re.sub(r'(?<![\$@%&\\])#.*$', '', line)
+        s = re.sub(r'"[^"\\]*(?:\\.[^"\\]*)*"', '""', s)
+        s = re.sub(r"'[^']*'", "''", s)
+        cleaned.append(s)
+
+    depth = 0
+    in_sub = False
+    sub_start = 0
+    sub_depth = 0
+    sub_name = ""
+    preamble_end = None
+
+    for i, cline in enumerate(cleaned):
+        if not in_sub:
+            m = _PERL_SUB_RE.search(cline)
+            if m:
+                sub_name = m.group(1)
+                sub_start = i
+                sub_depth = depth
+                in_sub = True
+                if preamble_end is None:
+                    preamble_end = i
+        depth += cline.count("{") - cline.count("}")
+        if in_sub and depth <= sub_depth:
+            body = "\n".join(lines[sub_start:i + 1])
+            functions.append((sub_name, body))
+            in_sub = False
+
+    if preamble_end is None:
+        preamble_end = 0
+    preamble = "\n".join(lines[:preamble_end]).strip()
+    if len(preamble) > 3000:
+        preamble = preamble[:3000] + "\n# ... (preamble truncated)"
+
+    if preamble:
+        functions = [
+            (name, f"# File-level context:\n{preamble}\n\n"
+                   f"# Function under review:\n{body}")
+            for name, body in functions
+        ]
+
+    return functions
+
+
+# ── JavaScript/TypeScript function extractor ───────────────────────────
+
+# Multiple forms we recognize at top level or inside class bodies:
+#   function name(...)
+#   async function name(...)
+#   class Foo { method(...) { ... } }
+#   export [default] function name(...)
+_JS_FUNC_RE = re.compile(
+    r'^(?:\s*)(?:export\s+(?:default\s+)?)?'
+    r'(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(',
+    re.MULTILINE,
+)
+# Inside class bodies: methodName(params) { or *methodName(params) { or
+# async methodName(params) { or get name() / set name(v)
+_JS_METHOD_RE = re.compile(
+    r'^\s*(?:static\s+)?(?:async\s+|get\s+|set\s+)?\*?\s*'
+    r'([A-Za-z_$#][\w$]*)\s*\([^)]*\)\s*\{',
+)
+_JS_CLASS_RE = re.compile(r'^\s*(?:export\s+(?:default\s+)?)?class\s+([A-Za-z_$][\w$]*)')
+
+
+def extract_node_functions(code: str) -> List[Tuple[str, str]]:
+    """Extract JS/TS top-level functions and class methods.
+
+    Arrow functions assigned to consts are *not* extracted — too noisy
+    and mostly short.  Focus is on named ``function`` declarations and
+    class methods, which is where exploitable logic usually lives.
+    """
+    functions: List[Tuple[str, str]] = []
+    lines = code.split("\n")
+    cleaned = _strip_comments_and_strings(code).split("\n")
+
+    depth = 0
+    class_stack: List[Tuple[int, str]] = []
+    in_fn = False
+    fn_start = 0
+    fn_depth_start = 0
+    fn_name = ""
+    preamble_end = None
+
+    # Reserved JS keywords that look like methods but aren't
+    _JS_KEYWORDS = {
+        "if", "else", "while", "for", "switch", "return", "throw",
+        "try", "catch", "finally", "do", "with", "typeof", "instanceof",
+        "new", "delete", "void", "in", "of", "yield", "await",
+        "function", "class", "var", "let", "const", "break", "continue",
+    }
+
+    for i, cline in enumerate(cleaned):
+        if not in_fn:
+            # Class declaration
+            cls_m = _JS_CLASS_RE.match(cline)
+            if cls_m and "{" in cline:
+                class_stack.append((depth, cls_m.group(1)))
+
+            # Top-level function declaration
+            fn_m = _JS_FUNC_RE.search(cline)
+            if fn_m and "{" in cline:
+                name = fn_m.group(1)
+                fn_name = name
+                fn_start = i
+                fn_depth_start = depth
+                in_fn = True
+                if preamble_end is None:
+                    preamble_end = i
+            # Class method — only when we're inside a class body
+            elif class_stack and depth > class_stack[-1][0]:
+                # Only look one level deep into the class (not nested blocks)
+                if depth == class_stack[-1][0] + 1:
+                    meth_m = _JS_METHOD_RE.match(cline)
+                    if meth_m and meth_m.group(1) not in _JS_KEYWORDS:
+                        name = f"{class_stack[-1][1]}.{meth_m.group(1)}"
+                        fn_name = name
+                        fn_start = i
+                        fn_depth_start = depth
+                        in_fn = True
+                        if preamble_end is None:
+                            preamble_end = i
+
+        depth += cline.count("{") - cline.count("}")
+
+        while class_stack and depth <= class_stack[-1][0]:
+            class_stack.pop()
+
+        if in_fn and depth <= fn_depth_start:
+            body = "\n".join(lines[fn_start:i + 1])
+            functions.append((fn_name, body))
+            in_fn = False
+
+    if preamble_end is None:
+        preamble_end = 0
+    preamble = "\n".join(lines[:preamble_end]).strip()
+    if len(preamble) > 3000:
+        preamble = preamble[:3000] + "\n// ... (preamble truncated)"
+
+    if preamble:
+        functions = [
+            (name, f"// File-level context:\n{preamble}\n\n"
+                   f"// Function under review:\n{body}")
+            for name, body in functions
+        ]
+
+    return functions
+
+
+# ── Dispatch table ─────────────────────────────────────────────────────
+
+FUNCTION_EXTRACTORS = {
+    "c_cpp": extract_c_functions,
+    "python": extract_python_functions,
+    "bash": extract_bash_functions,
+    "rust": extract_rust_functions,
+    "ruby": extract_ruby_functions,
+    "perl": extract_perl_functions,
+    "node": extract_node_functions,
+}
+
+
+def extract_functions(code: str, profile_name: str) -> List[Tuple[str, str]]:
+    """Dispatch to the right language extractor.
+
+    Returns an empty list for unknown profiles, letting the caller
+    fall back to whole-file scanning.
+    """
+    extractor = FUNCTION_EXTRACTORS.get(profile_name)
+    if extractor is None:
+        return []
+    try:
+        return extractor(code)
+    except Exception as e:
+        # Extractors are best-effort — never crash the scan
+        print(f"    [WARN] Function extraction failed for {profile_name}: {e}",
+              flush=True)
+        return []
+
+
 def chunk_file(code: str, max_chars: int = 40000) -> List[str]:
     """Split code into chunks that fit model context."""
     if len(code) <= max_chars:
@@ -1392,6 +2123,70 @@ def run_scan_stage(files: List[SourceFile], backend: Backend,
         save_stage_file_output(session_dir, stage_name, backend, relpath, chunk_records)
 
 
+def run_function_level_triage(files: List[SourceFile], backend: Backend,
+                              source_dir: str, session_dir: Path):
+    """Run paranoid triage on each function individually.
+
+    Extracts functions from C/C++ files and scans each one separately
+    with the paranoid triage prompt.  This catches subtle bugs (like
+    arithmetic errors in buffer calculations) that get lost when the
+    model sees the entire file at once.
+
+    For non-C/C++ files, falls back to whole-file scanning.
+    """
+    stage_name = "triage_catchup"
+
+    for i, source_file in enumerate(files):
+        filepath = source_file.path
+        profile = source_file.profile
+        relpath = str(filepath.relative_to(source_dir))
+        record_path = stage_record_path(session_dir, stage_name, relpath)
+        if record_path.exists():
+            print(f"  [{i+1}/{len(files)}] {relpath} (cached)", flush=True)
+            continue
+
+        code = filepath.read_text(errors="replace")
+
+        # Extract functions via the right language extractor, or fall
+        # back to whole-file scanning for unsupported profiles.
+        functions = extract_functions(code, profile.name)
+        if not functions:
+            functions = [("(whole file)", code)]
+
+        print(
+            f"  [{i+1}/{len(files)}] {relpath} [{profile.name}] "
+            f"({len(functions)} function(s))",
+            flush=True,
+        )
+
+        system_prompt = profile.triage_prompt
+        chunk_records = []
+
+        for fi, (func_name, func_code) in enumerate(functions):
+            label = f"{relpath}::{func_name}"
+            user_msg = f"SOURCE FILE: {label}\n```\n{func_code}\n```"
+
+            raw = backend.query(system_prompt, user_msg)
+
+            if not raw or not raw.strip():
+                raw = backend.query(system_prompt, user_msg)
+                if not raw or not raw.strip():
+                    raw = "[ERROR: empty response from model after retry]"
+
+            findings = parse_findings(raw, relpath, repr(backend), stage_name)
+            chunk_records.append({
+                "chunk_index": fi + 1,
+                "label": label,
+                "raw_output": raw,
+                "findings": [asdict(f) for f in findings],
+            })
+            if findings:
+                for f in findings:
+                    print(f"    -> {f.severity}: {f.location} ({f.type})", flush=True)
+
+        save_stage_file_output(session_dir, stage_name, backend, relpath, chunk_records)
+
+
 def find_cross_references(finding: Finding, source_dir: str,
                           finding_file: str) -> str:
     """Find likely cross-file references for the flagged symbol.
@@ -1737,32 +2532,27 @@ def run_pipeline(args) -> ScanResult:
         result.stage_stats = compute_stage_stats(session_dir)
         return result
 
-    # ── Stage 1b: Triage catch-up ──
-    # Files that triage couldn't analyze (context exceeded, empty responses,
-    # or had to be chunked) get a second paranoid pass using the reasoning
-    # backend, which typically has a larger context window and can see the
-    # whole file.  This uses the paranoid *triage* prompt, not the chain-
-    # tracing reasoning prompt — so the model flags patterns rather than
-    # requiring full source→sink traces.
+    # ── Stage 1b: Triage catch-up (function-level) ──
+    # Files that triage couldn't analyze get a function-by-function
+    # paranoid pass using the reasoning backend.  Whole-file scanning
+    # misses subtle bugs that get lost in the noise — scanning each
+    # function individually lets the model focus on the logic.
     if triage_forwarded and reasoning_backend:
         forwarded_paths = [
             f for f in files
             if str(f.path.relative_to(source_dir)) in triage_forwarded
         ]
         print(f"\n{'='*60}", flush=True)
-        print(f"TRIAGE CATCH-UP ({reasoning_backend})", flush=True)
-        print(f"  Paranoid triage prompt on {len(forwarded_paths)} file(s) "
-              f"that triage couldn't fully analyze", flush=True)
+        print(f"TRIAGE CATCH-UP — function-level ({reasoning_backend})", flush=True)
+        print(f"  Paranoid triage on {len(forwarded_paths)} file(s), "
+              f"one function at a time", flush=True)
         print(f"{'='*60}", flush=True)
 
-        run_scan_stage(
-            forwarded_paths, reasoning_backend, "triage_catchup",
-            source_dir, session_dir,
+        run_function_level_triage(
+            forwarded_paths, reasoning_backend, source_dir, session_dir,
         )
         catchup_findings = load_stage_findings(session_dir, "triage_catchup")
-        # Merge catch-up findings into triage findings for consensus.
-        # Re-tag them as "triage" stage so they count in cross-stage
-        # consensus with the reasoning stage.
+        # Re-tag as "triage" so they count in cross-stage consensus
         for f in catchup_findings:
             f.stage = "triage"
         triage_findings = triage_findings + catchup_findings

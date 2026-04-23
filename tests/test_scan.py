@@ -1236,7 +1236,8 @@ def test_catchup_runs_paranoid_prompt_on_failed_files(tmp_path, monkeypatch):
 
         def query(self, system, user, max_tokens=16384):
             label = user.splitlines()[0].removeprefix("SOURCE FILE: ")
-            filename = label.split(" (part ", 1)[0]
+            # Strip chunk suffix " (part N/M)" and function suffix "::name"
+            filename = label.split(" (part ", 1)[0].split("::", 1)[0]
             self.calls.append((filename, "paranoid" in system.lower()))
             return make_finding_text("main()", "overflow", "caught by catchup")
 
@@ -1337,3 +1338,282 @@ def test_pipeline_forwards_chunked_clean_files_to_reasoning(tmp_path, monkeypatc
     assert "big.c" in call_log["reasoning"]
     # small.c was clean and not chunked — should NOT go to reasoning
     assert "small.c" not in call_log["reasoning"]
+
+
+# ── Function extractor tests ──────────────────────────────────────────
+
+
+def test_extract_c_functions_finds_named_functions():
+    """Extractor pulls out C functions with their signatures."""
+    code = '''
+#include <stdio.h>
+
+typedef struct { int x; } Point;
+
+static int
+compute(int a, int b)
+{
+    return a + b;
+}
+
+void
+print_point(Point *p)
+{
+    printf("%d\\n", p->x);
+}
+'''
+    funcs = scan.extract_c_functions(code)
+    names = [n for n, _ in funcs]
+    assert "compute" in names
+    assert "print_point" in names
+    # Preamble should contain the typedef
+    compute_body = [body for n, body in funcs if n == "compute"][0]
+    assert "typedef" in compute_body
+    # Function body should include signature
+    assert "static int" in compute_body
+    assert "return a + b" in compute_body
+
+
+def test_extract_c_functions_ignores_control_flow():
+    """Extractor does not confuse `if (fopen(...)) {` for a function definition."""
+    code = '''
+static int
+process(const char *path)
+{
+    if (fopen(path, "r") == NULL) {
+        return 1;
+    }
+    while (realloc(buf, 100)) {
+        break;
+    }
+    return 0;
+}
+'''
+    funcs = scan.extract_c_functions(code)
+    names = [n for n, _ in funcs]
+    assert names == ["process"]
+    assert "fopen" not in names
+    assert "realloc" not in names
+
+
+def test_extract_c_functions_handles_kr_signature():
+    """K&R-style signature split across lines is captured with its type."""
+    code = '''
+static int
+_strbuf_reserve(struct strbuf *buffer, int add)
+{
+    return 0;
+}
+'''
+    funcs = scan.extract_c_functions(code)
+    assert len(funcs) == 1
+    name, body = funcs[0]
+    assert name == "_strbuf_reserve"
+    # The full signature must be in the body
+    assert "_strbuf_reserve(struct strbuf *buffer, int add)" in body
+    assert "static int" in body
+
+
+def test_extract_python_functions_finds_defs_and_methods():
+    code = '''
+import os
+
+def top_level(x):
+    return x + 1
+
+class Widget:
+    def __init__(self, name):
+        self.name = name
+
+    def greet(self):
+        print(f"hello {self.name}")
+
+async def async_func():
+    await something()
+'''
+    funcs = scan.extract_python_functions(code)
+    names = [n for n, _ in funcs]
+    assert "top_level" in names
+    assert "Widget.__init__" in names
+    assert "Widget.greet" in names
+    assert "async_func" in names
+
+
+def test_extract_python_functions_includes_decorators():
+    code = '''
+def outer():
+    pass
+
+@decorator
+@another_decorator
+def decorated():
+    return 1
+'''
+    funcs = scan.extract_python_functions(code)
+    decorated_body = [body for n, body in funcs if n == "decorated"][0]
+    assert "@decorator" in decorated_body
+    assert "@another_decorator" in decorated_body
+
+
+def test_extract_bash_functions_both_forms():
+    code = '''#!/bin/bash
+set -e
+LOG=/tmp/log
+
+do_backup() {
+    tar cf /tmp/backup.tar /data
+}
+
+function cleanup {
+    rm -rf /tmp/work
+}
+
+main() {
+    do_backup
+    cleanup
+}
+'''
+    funcs = scan.extract_bash_functions(code)
+    names = [n for n, _ in funcs]
+    assert "do_backup" in names
+    assert "cleanup" in names
+    assert "main" in names
+
+
+def test_extract_rust_functions_includes_impl_methods():
+    code = '''
+use std::io;
+
+struct Parser;
+
+impl Parser {
+    pub fn new() -> Self {
+        Parser
+    }
+
+    pub fn parse(&self, input: &str) -> Result<(), io::Error> {
+        Ok(())
+    }
+}
+
+pub fn standalone() -> i32 {
+    42
+}
+'''
+    funcs = scan.extract_rust_functions(code)
+    names = [n for n, _ in funcs]
+    assert "standalone" in names
+    assert "Parser::new" in names
+    assert "Parser::parse" in names
+
+
+def test_extract_ruby_functions_inside_class():
+    code = '''
+require "json"
+
+class Service
+  def initialize(config)
+    @config = config
+  end
+
+  def call(request)
+    process(request)
+  end
+
+  def self.factory
+    new({})
+  end
+end
+
+def top_level_method(x)
+  x * 2
+end
+'''
+    funcs = scan.extract_ruby_functions(code)
+    names = [n for n, _ in funcs]
+    assert "top_level_method" in names
+    # Class methods should be qualified
+    assert any("Service#initialize" in n or "initialize" in n for n in names)
+    assert any("Service#call" in n or "call" in n for n in names)
+
+
+def test_extract_perl_functions():
+    code = '''
+use strict;
+use warnings;
+
+package MyModule;
+
+sub new {
+    my $class = shift;
+    return bless {}, $class;
+}
+
+sub process ($$) {
+    my ($self, $arg) = @_;
+    return $arg;
+}
+'''
+    funcs = scan.extract_perl_functions(code)
+    names = [n for n, _ in funcs]
+    assert "new" in names
+    assert "process" in names
+
+
+def test_extract_node_functions_includes_methods():
+    code = '''
+import fs from "fs";
+
+function topLevel(x) {
+    return x + 1;
+}
+
+export async function handler(req, res) {
+    res.send("ok");
+}
+
+class Controller {
+    async show(req) {
+        return req.id;
+    }
+
+    static create() {
+        return new Controller();
+    }
+}
+'''
+    funcs = scan.extract_node_functions(code)
+    names = [n for n, _ in funcs]
+    assert "topLevel" in names
+    assert "handler" in names
+    assert "Controller.show" in names
+    assert "Controller.create" in names
+
+
+def test_extract_functions_dispatch_returns_empty_for_unknown():
+    """Unknown profiles return [] so caller falls back to whole-file scan."""
+    assert scan.extract_functions("int main() {}", "golang") == []
+    assert scan.extract_functions("int main() {}", "unknown_lang") == []
+
+
+def test_extract_functions_dispatch_dispatches_by_profile():
+    """Dispatch routes to the right extractor."""
+    c_funcs = scan.extract_functions(
+        "int foo(int x) { return x + 1; }\n", "c_cpp",
+    )
+    assert [n for n, _ in c_funcs] == ["foo"]
+
+    py_funcs = scan.extract_functions(
+        "def bar(x):\n    return x + 1\n", "python",
+    )
+    assert [n for n, _ in py_funcs] == ["bar"]
+
+
+def test_extract_functions_survives_crash_in_extractor(monkeypatch):
+    """Extractor exceptions don't kill the scan."""
+    def boom(code):
+        raise RuntimeError("parser exploded")
+
+    monkeypatch.setitem(scan.FUNCTION_EXTRACTORS, "c_cpp", boom)
+    # Should not raise — returns empty for caller to fall back
+    assert scan.extract_functions("anything", "c_cpp") == []
