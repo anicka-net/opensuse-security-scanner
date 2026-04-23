@@ -2409,7 +2409,15 @@ def run_caller_pass(catchup_findings: List[Finding],
         evaluations = []
         for finding in file_findings:
             prior = confirmation_results.get(finding.key(), {})
-            callers = find_cross_references(finding, source_dir, finding.file)
+            # Honor CALLERS_OF if the model specified which symbols it needs
+            requested = prior.get("callers_of", "")
+            requested_symbols = [
+                s.strip() for s in re.split(r'[,\s]+', requested) if s.strip()
+            ] if requested else None
+            callers = find_cross_references(
+                finding, source_dir, finding.file,
+                symbols=requested_symbols,
+            )
             if not callers:
                 callers = "(no call sites found in other files)"
             prompt = CALLER_PROMPT.format(
@@ -2470,21 +2478,29 @@ def load_confirmation_results(session_dir: Path,
 
 
 def find_cross_references(finding: Finding, source_dir: str,
-                          finding_file: str) -> str:
+                          finding_file: str,
+                          symbols: Optional[List[str]] = None) -> str:
     """Find likely cross-file references for the flagged symbol.
 
-    This is a heuristic: it extracts a likely symbol from the finding
+    This is a heuristic: it extracts likely symbols from the finding
     and searches other project files for invocation-shaped references.
+
+    If ``symbols`` is given, use those names verbatim instead of
+    guessing from the finding.  Useful when the model explicitly
+    requests callers of a specific function via CALLERS_OF.
     """
-    location = finding.location or ""
-    candidates = []
-    match = re.match(r'(\w+(?:::\w+)?)', location)
-    if match:
-        candidates.append(match.group(1))
-    if finding.sink:
-        sink_match = re.match(r'[`]?(\w+(?:::\w+)?)', finding.sink)
-        if sink_match:
-            candidates.append(sink_match.group(1))
+    if symbols:
+        candidates = [s for s in symbols if s]
+    else:
+        location = finding.location or ""
+        candidates = []
+        match = re.match(r'(\w+(?:::\w+)?)', location)
+        if match:
+            candidates.append(match.group(1))
+        if finding.sink:
+            sink_match = re.match(r'[`]?(\w+(?:::\w+)?)', finding.sink)
+            if sink_match:
+                candidates.append(sink_match.group(1))
 
     if not candidates:
         return ""
@@ -2819,6 +2835,21 @@ def run_pipeline(args) -> ScanResult:
             flush=True,
         )
 
+    def recompute_clean_files(kept_findings: List[Finding]) -> None:
+        """Mark files clean if no kept finding references them.
+
+        Called after each late pipeline return so files forwarded to
+        catch-up that ended up clean still appear in the report's
+        clean list.
+        """
+        flagged_now = {f.file for f in kept_findings}
+        result.files_with_findings = len(flagged_now)
+        result.clean_files = [
+            str(f.path.relative_to(source_dir))
+            for f in files
+            if str(f.path.relative_to(source_dir)) not in flagged_now
+        ]
+
     if not triage_findings and not triage_forwarded:
         print("\nTriage: All files clean.", flush=True)
         result.clean_files = [str(f.path.relative_to(source_dir)) for f in files]
@@ -2841,6 +2872,7 @@ def run_pipeline(args) -> ScanResult:
 
     if args.triage_only:
         result.findings = triage_findings
+        recompute_clean_files(triage_findings)
         result.stage_stats = compute_stage_stats(session_dir)
         return result
 
@@ -2916,6 +2948,20 @@ def run_pipeline(args) -> ScanResult:
                 flush=True,
             )
 
+            # Drop catch-up findings that confirmation rejected.  Their
+            # reasoning stays in session_dir/triage_confirm/ for the
+            # report.  Ambiguous (UNPARSED / missing) outcomes are kept
+            # to fail safe — verdict can still reject them later.
+            kept = [
+                f for f in catchup_findings
+                if confirmation.get(f.key(), {}).get("outcome") != "FALSE_POSITIVE"
+            ]
+            dropped = len(catchup_findings) - len(kept)
+            if dropped:
+                print(f"  Dropped {dropped} catch-up finding(s) rejected by "
+                      f"confirmation.", flush=True)
+            catchup_findings = kept
+
         triage_findings = triage_findings + catchup_findings
 
     # ── Stage 2: Reasoning ──
@@ -2950,6 +2996,7 @@ def run_pipeline(args) -> ScanResult:
 
     if not verdict_backend:
         result.findings = [f for group in consensus for f in group["findings"]]
+        recompute_clean_files(result.findings)
         result.stage_stats = compute_stage_stats(session_dir)
         return result
 
@@ -2967,6 +3014,7 @@ def run_pipeline(args) -> ScanResult:
             continue
         result.findings.extend(group["findings"])
 
+    recompute_clean_files(result.findings)
     result.stage_stats = compute_stage_stats(session_dir)
     return result
 

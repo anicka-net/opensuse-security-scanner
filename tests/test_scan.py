@@ -1828,3 +1828,190 @@ def test_verdict_prompt_includes_confirmation_notes(tmp_path, monkeypatch):
     joined = "\n".join(prompts_sent)
     assert "confirmation REASONING MARKER" in joined
     assert "Prior confirmation pass notes" in joined
+
+
+# ── Regression tests for GPT review fixes ────────────────────────────
+
+
+def test_fp_catchup_findings_dropped_before_reasoning(tmp_path, monkeypatch):
+    """Fix #1: catch-up findings marked FALSE_POSITIVE must not reach reasoning."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "big.c").write_text("int main() { return 0; }\n")
+
+    reasoning_calls = []
+
+    class FailingTriage(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            return "[ERROR: context exceeded]"
+        def __repr__(self):
+            return "test/fail-triage"
+
+    class Reasoning(scan.Backend):
+        def __init__(self):
+            self.state = "catchup"
+            self.calls = []
+
+        def query(self, system, user, max_tokens=16384):
+            self.calls.append(user[:120])
+            if "OUTCOME:" in user or "A previous function-level scan" in user:
+                # Confirmation prompt — reject the finding
+                return "OUTCOME: FALSE_POSITIVE\nREASONING: unreachable in context"
+            if "triage_hints" in user.lower() or "NOTE:" in user:
+                reasoning_calls.append("reasoning_with_hints")
+                return "CLEAN"
+            if "paranoid" in system.lower():
+                # Catch-up paranoid scan — flag it
+                return make_finding_text("main()", "overflow", "pattern smells")
+            reasoning_calls.append("reasoning_plain")
+            return "CLEAN"
+
+    reasoning = Reasoning()
+    backends = {
+        "test/fail-triage": FailingTriage(),
+        "test/reason": reasoning,
+    }
+    monkeypatch.setattr(scan, "parse_backend_spec", lambda spec: backends[spec])
+
+    args = Namespace(
+        source_dir=str(source_dir),
+        obs_package=None,
+        package_name="pkg",
+        output=str(tmp_path / "report.md"),
+        json=None,
+        scratch_dir=str(tmp_path / "scratch"),
+        profile="c_cpp",
+        triage="test/fail-triage",
+        reasoning="test/reason",
+        verdict=None,
+        triage_only=False,
+    )
+    result = scan.run_pipeline(args)
+
+    # The FP catch-up finding must not end up in result.findings
+    assert not any(
+        f.file == "big.c" and f.stage == "triage"
+        for f in result.findings
+    ), f"FP finding leaked into result: {result.findings}"
+
+
+def test_caller_pass_honors_callers_of(tmp_path):
+    """Fix #2: caller pass passes CALLERS_OF symbols to cross-ref search."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "lib.c").write_text("void vuln(char *p) { }\n")
+    # two distinct possible callers — lib calls only one of them
+    (source_dir / "a.c").write_text("int main() { wrapper_one(buf); }\n")
+    (source_dir / "b.c").write_text("int main() { wrapper_two(buf); }\n")
+
+    session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "pkg")
+
+    finding = scan.Finding(
+        severity="High", location="vuln", type="overflow", description="",
+        exploitation="", file="lib.c", model="test", stage="triage",
+    )
+    # Confirmation asks for callers of wrapper_one specifically
+    confirmation = {
+        finding.key(): {
+            "outcome": "NEED_CALLERS",
+            "reasoning": "vuln isn't called here directly",
+            "callers_of": "wrapper_one",
+        }
+    }
+
+    queries_seen = []
+
+    class CaptureBackend(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            queries_seen.append(user)
+            return "OUTCOME: CONFIRMED\nREASONING: ok"
+        def __repr__(self):
+            return "test/capture"
+
+    scan.run_caller_pass(
+        [finding], confirmation, CaptureBackend(),
+        str(source_dir), session_dir,
+    )
+
+    assert queries_seen, "caller pass didn't call the backend"
+    text = queries_seen[0]
+    # Caller pass should have included a.c (wrapper_one's file), not b.c
+    assert "a.c" in text
+    assert "b.c" not in text
+
+
+def test_find_cross_references_uses_explicit_symbols(tmp_path):
+    """find_cross_references honors an explicit symbols list."""
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.cpp").write_text("void caller() { target_fn(); }\n")
+    (tmp_path / "pkg" / "b.cpp").write_text("void caller() { other_fn(); }\n")
+
+    finding = scan.Finding(
+        severity="High", location="vulnerable", type="x", description="",
+        exploitation="", file="pkg/src.cpp", model="m", stage="triage",
+    )
+    result = scan.find_cross_references(
+        finding, str(tmp_path), "pkg/src.cpp",
+        symbols=["target_fn"],
+    )
+    assert "a.cpp" in result
+    assert "target_fn" in result
+    # Without symbols it would use finding.location = "vulnerable" — nothing found
+    assert "b.cpp" not in result
+
+
+def test_clean_files_recomputed_after_fp_drops(tmp_path, monkeypatch):
+    """Fix #3: file forwarded but all findings dropped ends up in clean_files."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "forwarded.c").write_text("int main() { return 0; }\n")
+    (source_dir / "always_clean.c").write_text("int ok() { return 0; }\n")
+
+    class FailOnlyBigTriage(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            label = user.splitlines()[0].removeprefix("SOURCE FILE: ")
+            filename = label.split(" (part ", 1)[0].split("::", 1)[0]
+            if "forwarded.c" in filename:
+                return "[ERROR: context exceeded]"
+            return "CLEAN"
+        def __repr__(self):
+            return "test/fail-triage"
+
+    class Reasoning(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            # Every second-stage answer is either CLEAN or OUTCOME: FP
+            if "A previous function-level scan" in user:
+                return "OUTCOME: FALSE_POSITIVE\nREASONING: not reachable"
+            if "paranoid" in system.lower():
+                return make_finding_text("main()", "overflow", "catch-up flagged")
+            return "CLEAN"
+        def __repr__(self):
+            return "test/reason"
+
+    backends = {
+        "test/fail-triage": FailOnlyBigTriage(),
+        "test/reason": Reasoning(),
+    }
+    monkeypatch.setattr(scan, "parse_backend_spec", lambda spec: backends[spec])
+
+    args = Namespace(
+        source_dir=str(source_dir),
+        obs_package=None,
+        package_name="pkg",
+        output=str(tmp_path / "report.md"),
+        json=None,
+        scratch_dir=str(tmp_path / "scratch"),
+        profile="c_cpp",
+        triage="test/fail-triage",
+        reasoning="test/reason",
+        verdict=None,
+        triage_only=False,
+    )
+    result = scan.run_pipeline(args)
+
+    # forwarded.c got flagged by catch-up, then confirmed as FP.
+    # It should land in clean_files (alongside always_clean.c).
+    assert "forwarded.c" in result.clean_files, (
+        f"forwarded-but-cleared file missing from clean_files: {result.clean_files}"
+    )
+    assert "always_clean.c" in result.clean_files
