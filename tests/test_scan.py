@@ -1210,6 +1210,71 @@ def test_find_chunked_files(tmp_path):
     assert chunked == ["big.c"]
 
 
+def test_catchup_runs_paranoid_prompt_on_failed_files(tmp_path, monkeypatch):
+    """Failed triage files get a paranoid pass via the reasoning backend."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "big.c").write_text("int main() { return 0; }\n")
+    (source_dir / "small.c").write_text("int ok() { return 0; }\n")
+
+    prompts_by_stage = {}
+
+    class FailingTriageBackend(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            label = user.splitlines()[0].removeprefix("SOURCE FILE: ")
+            filename = label.split(" (part ", 1)[0]
+            if "big.c" in filename:
+                return "[ERROR: context exceeded]"
+            return "CLEAN"
+
+        def __repr__(self):
+            return "test/failing-triage"
+
+    class ReasoningBackend(scan.Backend):
+        def __init__(self):
+            self.calls = []  # (filename, is_paranoid)
+
+        def query(self, system, user, max_tokens=16384):
+            label = user.splitlines()[0].removeprefix("SOURCE FILE: ")
+            filename = label.split(" (part ", 1)[0]
+            self.calls.append((filename, "paranoid" in system.lower()))
+            return make_finding_text("main()", "overflow", "caught by catchup")
+
+        def __repr__(self):
+            return "test/reasoning"
+
+    reasoning_be = ReasoningBackend()
+    backends = {
+        "test/failing-triage": FailingTriageBackend(),
+        "test/reasoning": reasoning_be,
+    }
+    monkeypatch.setattr(scan, "parse_backend_spec", lambda spec: backends[spec])
+
+    args = Namespace(
+        source_dir=str(source_dir),
+        obs_package=None,
+        package_name="pkg",
+        output=str(tmp_path / "report.md"),
+        json=None,
+        scratch_dir=str(tmp_path / "scratch"),
+        profile="c_cpp",
+        triage="test/failing-triage",
+        reasoning="test/reasoning",
+        verdict=None,
+        triage_only=False,
+    )
+
+    result = scan.run_pipeline(args)
+
+    # big.c should have been called twice: catch-up (paranoid) then reasoning (not)
+    big_calls = [(f, paranoid) for f, paranoid in reasoning_be.calls if f == "big.c"]
+    assert len(big_calls) == 2
+    # First call was catch-up with paranoid prompt
+    assert big_calls[0] == ("big.c", True)
+    # Second call was reasoning with chain-tracing prompt
+    assert big_calls[1] == ("big.c", False)
+
+
 def test_pipeline_forwards_chunked_clean_files_to_reasoning(tmp_path, monkeypatch):
     """Clean files that were chunked in triage get forwarded to reasoning."""
     source_dir = tmp_path / "src"

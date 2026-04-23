@@ -1137,7 +1137,7 @@ def load_progress_entries(session_dir: Path) -> List[dict]:
 def compute_stage_stats(session_dir: Path) -> dict:
     """Summarize persisted progress by stage."""
     stats = {}
-    for stage in ("triage", "reasoning", "verdict"):
+    for stage in ("triage", "triage_catchup", "reasoning", "verdict"):
         entries = [e for e in load_progress_entries(session_dir) if e["stage"] == stage]
         stats[stage] = {
             "completed_files": len(entries),
@@ -1338,7 +1338,9 @@ def run_scan_stage(files: List[SourceFile], backend: Backend,
                 label = f"{relpath} (part {ci+1}/{len(chunks)})"
             user_msg = f"SOURCE FILE: {label}\n```\n{chunk}\n```{hint_suffix}"
 
-            system_prompt = profile.triage_prompt if stage_name == "triage" else profile.reasoning_prompt
+            system_prompt = profile.reasoning_prompt
+            if stage_name in ("triage", "triage_catchup"):
+                system_prompt = profile.triage_prompt
             raw = backend.query(system_prompt, user_msg)
 
             # On context overflow, re-chunk this chunk smaller and retry
@@ -1735,11 +1737,52 @@ def run_pipeline(args) -> ScanResult:
         result.stage_stats = compute_stage_stats(session_dir)
         return result
 
+    # ── Stage 1b: Triage catch-up ──
+    # Files that triage couldn't analyze (context exceeded, empty responses,
+    # or had to be chunked) get a second paranoid pass using the reasoning
+    # backend, which typically has a larger context window and can see the
+    # whole file.  This uses the paranoid *triage* prompt, not the chain-
+    # tracing reasoning prompt — so the model flags patterns rather than
+    # requiring full source→sink traces.
+    if triage_forwarded and reasoning_backend:
+        forwarded_paths = [
+            f for f in files
+            if str(f.path.relative_to(source_dir)) in triage_forwarded
+        ]
+        print(f"\n{'='*60}", flush=True)
+        print(f"TRIAGE CATCH-UP ({reasoning_backend})", flush=True)
+        print(f"  Paranoid triage prompt on {len(forwarded_paths)} file(s) "
+              f"that triage couldn't fully analyze", flush=True)
+        print(f"{'='*60}", flush=True)
+
+        run_scan_stage(
+            forwarded_paths, reasoning_backend, "triage_catchup",
+            source_dir, session_dir,
+        )
+        catchup_findings = load_stage_findings(session_dir, "triage_catchup")
+        # Merge catch-up findings into triage findings for consensus.
+        # Re-tag them as "triage" stage so they count in cross-stage
+        # consensus with the reasoning stage.
+        for f in catchup_findings:
+            f.stage = "triage"
+        triage_findings = triage_findings + catchup_findings
+        if catchup_findings:
+            catchup_files = {f.file for f in catchup_findings}
+            print(
+                f"\nCatch-up: {len(catchup_findings)} findings in "
+                f"{len(catchup_files)} files",
+                flush=True,
+            )
+        else:
+            print("\nCatch-up: no additional findings.", flush=True)
+
     # ── Stage 2: Reasoning ──
     print(f"\n{'='*60}", flush=True)
     print(f"REASONING ({reasoning_backend})", flush=True)
     print(f"{'='*60}", flush=True)
 
+    # Re-compute flagged files: catch-up may have found new ones
+    flagged_files = {f.file for f in triage_findings} | triage_forwarded
     flagged_paths = [f for f in files if str(f.path.relative_to(source_dir)) in flagged_files]
 
     # Build triage hints: map each flagged file to its triage findings
@@ -1812,12 +1855,13 @@ def generate_report(result: ScanResult, output_path: str):
     if result.stage_stats:
         lines.append("## Scan funnel\n")
         lines.append(f"- **Files scanned**: {result.files_scanned}")
-        for stage in ("triage", "reasoning", "verdict"):
+        for stage in ("triage", "triage_catchup", "reasoning", "verdict"):
             stats = result.stage_stats.get(stage)
-            if not stats:
+            if not stats or not stats.get("completed_files"):
                 continue
+            label = "Triage catch-up" if stage == "triage_catchup" else stage.capitalize()
             lines.append(
-                f"- **{stage.capitalize()}**: {stats['completed_files']} files, "
+                f"- **{label}**: {stats['completed_files']} files, "
                 f"{stats['files_with_findings']} with findings, "
                 f"{stats['total_findings']} total findings"
             )
