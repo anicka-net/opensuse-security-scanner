@@ -1089,6 +1089,27 @@ def load_stage_findings(session_dir: Path, stage_name: str) -> List[Finding]:
     return findings
 
 
+def find_failed_files(session_dir: Path, stage_name: str) -> List[str]:
+    """Find files where every chunk returned an error (context exceeded, etc).
+
+    These files were never actually analyzed and should be forwarded to the
+    next pipeline stage rather than silently treated as clean.
+    """
+    failed = []
+    for path in sorted((session_dir / stage_name).rglob("*.json")):
+        payload = load_json(path)
+        chunks = payload.get("chunks", [])
+        if not chunks:
+            continue
+        all_errored = all(
+            c.get("raw_output", "").startswith("[ERROR:")
+            for c in chunks
+        )
+        if all_errored:
+            failed.append(payload["file"])
+    return failed
+
+
 def load_progress_entries(session_dir: Path) -> List[dict]:
     """Load progress events from the session directory."""
     path = session_dir / "progress.jsonl"
@@ -1303,6 +1324,33 @@ def run_scan_stage(files: List[SourceFile], backend: Backend,
 
             system_prompt = profile.triage_prompt if stage_name == "triage" else profile.reasoning_prompt
             raw = backend.query(system_prompt, user_msg)
+
+            # On context overflow, re-chunk this chunk smaller and retry
+            if raw and "[ERROR: context exceeded]" in raw:
+                sub_chunks = chunk_file(chunk, max_chars=len(chunk) // 2 or 1000)
+                if len(sub_chunks) > 1:
+                    print(f"    [WARN] Context exceeded for {label}, "
+                          f"re-chunking into {len(sub_chunks)} smaller pieces",
+                          flush=True)
+                    for sci, sc in enumerate(sub_chunks):
+                        sub_label = f"{relpath} (part {ci+1}.{sci+1}/{len(chunks)})"
+                        sub_msg = f"SOURCE FILE: {sub_label}\n```\n{sc}\n```{hint_suffix}"
+                        sub_raw = backend.query(system_prompt, sub_msg)
+                        if not sub_raw or not sub_raw.strip():
+                            sub_raw = backend.query(system_prompt, sub_msg)
+                            if not sub_raw or not sub_raw.strip():
+                                sub_raw = "[ERROR: empty response from model after retry]"
+                        sub_findings = parse_findings(sub_raw, relpath, repr(backend), stage_name)
+                        chunk_records.append({
+                            "chunk_index": len(chunk_records) + 1,
+                            "label": sub_label,
+                            "raw_output": sub_raw,
+                            "findings": [asdict(f) for f in sub_findings],
+                        })
+                        if sub_findings:
+                            for f in sub_findings:
+                                print(f"    -> {f.severity}: {f.location} ({f.type})", flush=True)
+                    continue
 
             # Retry once on empty response — models sometimes silently
             # return empty when near context limits
@@ -1622,13 +1670,23 @@ def run_pipeline(args) -> ScanResult:
     run_scan_stage(files, triage_backend, "triage", source_dir, session_dir)
     triage_findings = load_stage_findings(session_dir, "triage")
 
-    if not triage_findings:
+    # Detect files that failed triage entirely (context exceeded, etc.)
+    # These must still go to reasoning — they weren't analyzed, not clean.
+    triage_failed = set(find_failed_files(session_dir, "triage"))
+    if triage_failed:
+        print(
+            f"\n[WARN] {len(triage_failed)} file(s) failed triage "
+            f"(will forward to reasoning): {', '.join(sorted(triage_failed))}",
+            flush=True,
+        )
+
+    if not triage_findings and not triage_failed:
         print("\nTriage: All files clean.", flush=True)
         result.clean_files = [str(f.path.relative_to(source_dir)) for f in files]
         result.stage_stats = compute_stage_stats(session_dir)
         return result
 
-    flagged_files = {f.file for f in triage_findings}
+    flagged_files = {f.file for f in triage_findings} | triage_failed
     result.files_with_findings = len(flagged_files)
     result.clean_files = [
         str(f.path.relative_to(source_dir))
@@ -1636,7 +1694,9 @@ def run_pipeline(args) -> ScanResult:
         if str(f.path.relative_to(source_dir)) not in flagged_files
     ]
     print(
-        f"\nTriage: {len(triage_findings)} findings in {len(flagged_files)} files",
+        f"\nTriage: {len(triage_findings)} findings in "
+        f"{len(flagged_files - triage_failed)} files"
+        + (f" + {len(triage_failed)} failed file(s) forwarded" if triage_failed else ""),
         flush=True,
     )
 

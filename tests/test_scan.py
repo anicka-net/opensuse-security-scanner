@@ -1034,3 +1034,158 @@ def test_resolve_header_budget_cap(tmp_path):
     )
     # Result should be within budget + wrapper text
     assert len(result) <= scan.HEADER_BUDGET + 200
+
+
+# ── Context-exceeded recovery tests ─────────────────────────────────
+
+
+def test_find_failed_files_detects_errored_triage(tmp_path):
+    """Files where all chunks returned errors are detected as failed."""
+    session_id, session_dir = scan.make_session_dir(str(tmp_path), "pkg")
+
+    # File that failed: all chunks errored
+    scan.save_stage_file_output(session_dir, "triage", FakeBackend("test"), "big.c", [
+        {
+            "chunk_index": 1,
+            "label": "big.c",
+            "raw_output": "[ERROR: context exceeded]",
+            "findings": [],
+        }
+    ])
+
+    # File that succeeded: clean output
+    scan.save_stage_file_output(session_dir, "triage", FakeBackend("test"), "ok.c", [
+        {
+            "chunk_index": 1,
+            "label": "ok.c",
+            "raw_output": "CLEAN",
+            "findings": [],
+        }
+    ])
+
+    # File that partially failed: one chunk errored, one succeeded
+    scan.save_stage_file_output(session_dir, "triage", FakeBackend("test"), "partial.c", [
+        {
+            "chunk_index": 1,
+            "label": "partial.c (part 1/2)",
+            "raw_output": "[ERROR: context exceeded]",
+            "findings": [],
+        },
+        {
+            "chunk_index": 2,
+            "label": "partial.c (part 2/2)",
+            "raw_output": make_finding_text("foo()", "overflow", "found it"),
+            "findings": [{"severity": "High", "location": "foo()", "type": "overflow",
+                         "description": "found it", "exploitation": "",
+                         "file": "partial.c", "model": "test", "stage": "triage"}],
+        },
+    ])
+
+    failed = scan.find_failed_files(session_dir, "triage")
+    assert failed == ["big.c"]
+
+
+def test_context_exceeded_rechunks_and_retries(tmp_path):
+    """When a chunk hits context exceeded, it is split and retried."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    # File big enough that halving produces 2 sub-chunks
+    (source_dir / "big.c").write_text("int x;\n" * 500)
+
+    call_count = {"n": 0}
+
+    class ContextLimitedBackend(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            call_count["n"] += 1
+            # First call: simulate context exceeded
+            if call_count["n"] == 1:
+                return "[ERROR: context exceeded]"
+            # Sub-chunks succeed
+            return make_finding_text("x", "overflow", "found in sub-chunk")
+
+        def __repr__(self):
+            return "test/limited"
+
+    session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "pkg")
+    c_profile = scan.load_profile("c_cpp")
+    scan.run_scan_stage(
+        [scan.SourceFile(source_dir / "big.c", c_profile)],
+        ContextLimitedBackend(), "triage", str(source_dir), session_dir,
+    )
+
+    # Should have re-chunked and found things
+    findings = scan.load_stage_findings(session_dir, "triage")
+    assert len(findings) >= 1
+    assert call_count["n"] >= 3  # 1 failed + at least 2 sub-chunks
+
+    # Should NOT be detected as failed
+    failed = scan.find_failed_files(session_dir, "triage")
+    assert failed == []
+
+
+def test_pipeline_forwards_failed_triage_to_reasoning(tmp_path, monkeypatch):
+    """Files that fail triage entirely are forwarded to reasoning."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "big.c").write_text("int main() { return 0; }\n")
+    (source_dir / "small.c").write_text("int ok() { return 0; }\n")
+
+    class FailingTriageBackend(scan.Backend):
+        def __init__(self):
+            self.seen_files = []
+
+        def query(self, system, user, max_tokens=16384):
+            label = user.splitlines()[0].removeprefix("SOURCE FILE: ")
+            filename = label.split(" (part ", 1)[0]
+            self.seen_files.append(filename)
+            if "big.c" in filename:
+                return "[ERROR: context exceeded]"
+            return "CLEAN"
+
+        def __repr__(self):
+            return "test/failing-triage"
+
+    class ReasoningBackend(scan.Backend):
+        def __init__(self):
+            self.seen_files = []
+
+        def query(self, system, user, max_tokens=16384):
+            label = user.splitlines()[0].removeprefix("SOURCE FILE: ")
+            filename = label.split(" (part ", 1)[0]
+            self.seen_files.append(filename)
+            return make_finding_text("main()", "overflow", "reasoning found it")
+
+        def __repr__(self):
+            return "test/reasoning"
+
+    triage_be = FailingTriageBackend()
+    reasoning_be = ReasoningBackend()
+
+    backends = {
+        "test/failing-triage": triage_be,
+        "test/reasoning": reasoning_be,
+    }
+    monkeypatch.setattr(scan, "parse_backend_spec", lambda spec: backends[spec])
+
+    args = Namespace(
+        source_dir=str(source_dir),
+        obs_package=None,
+        package_name="pkg",
+        output=str(tmp_path / "report.md"),
+        json=None,
+        scratch_dir=str(tmp_path / "scratch"),
+        profile="c_cpp",
+        triage="test/failing-triage",
+        reasoning="test/reasoning",
+        verdict=None,
+        triage_only=False,
+    )
+
+    result = scan.run_pipeline(args)
+
+    # big.c failed triage but should have been forwarded to reasoning
+    assert "big.c" in reasoning_be.seen_files
+    # small.c was clean, should NOT go to reasoning
+    assert "small.c" not in reasoning_be.seen_files
+    # The reasoning finding should be in results
+    assert any(f.file == "big.c" for f in result.findings)
