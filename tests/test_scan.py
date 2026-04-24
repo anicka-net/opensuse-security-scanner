@@ -1660,6 +1660,33 @@ def test_parse_confirmation_outcome_unparsed():
     assert result["outcome"] == "UNPARSED"
 
 
+def test_parse_confirmation_outcome_additional_finding():
+    """Confirmation may surface a side-observation as ADDITIONAL_FINDING."""
+    raw = (
+        "OUTCOME: FALSE_POSITIVE\n"
+        "REASONING: The described off-by-one is impossible because of the "
+        "strict inequality.\n"
+        "ADDITIONAL_FINDING: High / check_account / Use-After-Free / "
+        "read_field frees the buffer on EOF without clearing the pointer."
+    )
+    result = scan._parse_confirmation_outcome(raw)
+    assert result["outcome"] == "FALSE_POSITIVE"
+    assert "Use-After-Free" in result["additional_finding"]
+    assert "read_field frees" in result["additional_finding"]
+    # REASONING must stop at ADDITIONAL_FINDING, not bleed into it.
+    assert "Use-After-Free" not in result["reasoning"]
+
+
+def test_parse_confirmation_outcome_no_additional_finding():
+    """Absence of ADDITIONAL_FINDING leaves the field empty."""
+    raw = (
+        "OUTCOME: CONFIRMED\n"
+        "REASONING: real bug via attacker-controlled .pam_environment"
+    )
+    result = scan._parse_confirmation_outcome(raw)
+    assert result["additional_finding"] == ""
+
+
 def test_run_confirmation_pass_saves_results(tmp_path):
     """Confirmation pass writes JSON per file and returns parsed outcomes."""
     source_dir = tmp_path / "src"

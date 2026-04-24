@@ -2190,8 +2190,8 @@ def run_function_level_triage(files: List[SourceFile], backend: Backend,
 
 # ── Confirmation passes (2 and 3) ──────────────────────────────────────
 
-CONFIRMATION_PROMPT = """A previous function-level scan of this file \
-flagged the following potential vulnerability:
+CONFIRMATION_PROMPT = """A previous function-level scan flagged a
+potential vulnerability:
 
 FINDING:
 SEVERITY: {severity}
@@ -2199,24 +2199,69 @@ LOCATION: {location}
 TYPE: {type}
 DESCRIPTION: {description}
 
-Now I'm showing you the WHOLE file. Re-evaluate the finding given this
-broader context. Ask yourself:
+Now I'm showing you the WHOLE file. Decide which of these applies:
 
-1. Is the flagged code reachable with attacker-controlled input given
-   the rest of the file?
-2. Do preconditions elsewhere in the file rule out the exploit?
-3. Can you describe a concrete trigger from something visible in this file?
+  CONFIRMED — one of:
+    (a) the exact mechanism described is real and exploitable, OR
+    (b) the described mechanism is slightly wrong but a related real
+        vulnerability exists in the same code (e.g. the bug is in a
+        helper the finding didn't name, or the category label is off
+        but the code is genuinely unsafe).  State the corrected
+        mechanism in REASONING.
 
-If you need to see callers from OTHER files to judge exploitability,
-respond with NEED_CALLERS and specify which function(s) whose callers
-you need to see.
+  FALSE_POSITIVE — the code is genuinely safe.  Your reasoning must:
+    - If rejecting due to preconditions: cite the specific check and
+      where it lives.
+    - If rejecting because input is "not attacker-controlled" or
+      "physically impossible": state the concrete assumption and
+      whether it is enforced by code visible in this file or merely
+      trusted from an external library, kernel, or filesystem layout.
+      Trusted-from-upstream is weaker than enforced-in-scope.
+
+  NEED_CALLERS — you cannot decide without seeing how specific functions
+    are called from other files.  Specify which functions.
+
+KEY PROCEDURE — when the finding involves a sink that calls a helper
+(allocator, validator, reserve/resize/grow, length-check), DO NOT just
+refute the finding's wording.  Open the helper's code and check it
+branch by branch.
+
+For grow/resize/reserve helpers specifically:
+  - Identify every branch that sets the new capacity `s`.
+  - For each branch, find concrete (existing_length, current_size,
+    requested_add) tuples that reach that branch.
+  - For each branch, check: does `s >= existing_length + requested_add
+    + 1` (where +1 covers a null terminator, if applicable)?
+  - A doubling branch (`s = size * 2`) is a classic bug site: if the
+    guard only ensures `size * 2 >= add + 1` but not `size * 2 >=
+    len + add + 1`, then a full buffer (len ≈ size) with moderate add
+    overflows the realloc'd region.
+  - Do NOT accept "the helper returns success so it must be fine";
+    prove the post-resize capacity in every branch.
+
+For validator helpers: check each input class the validator accepts,
+not just the class the finding mentions.
+
+For integer-arithmetic bugs: if the finding mentions overflow, consider
+whether the arithmetic can also silently truncate, wrap to a small
+value, or produce a negative signed value that becomes a huge unsigned
+after a cast.
+
+If while evaluating this finding you notice a SEPARATE real
+vulnerability in the same file, surface it as ADDITIONAL_FINDING.
 
 Respond in this exact format (no other text):
 
 OUTCOME: CONFIRMED | FALSE_POSITIVE | NEED_CALLERS
-REASONING: <why — be specific about the path from input to sink, or
-            what rules out exploitation>
+REASONING: <concrete path from input to sink; OR what specifically
+            rules out exploitation.  If CONFIRMED (b), name the real
+            mechanism and the function/branch that owns the root cause.
+            For resize helpers, show the (len, size, add) tuple that
+            triggers the unsafe branch, or prove every branch is safe.>
 CALLERS_OF: <comma-separated function names, only if NEED_CALLERS>
+ADDITIONAL_FINDING: <optional — SEVERITY / LOCATION / TYPE / DESCRIPTION
+                     of a separate vuln noticed in passing; omit the
+                     line entirely if none>
 
 Source file:
 ```
@@ -2253,18 +2298,28 @@ def _parse_confirmation_outcome(raw: str) -> dict:
         raw,
     )
     outcome = outcome_m.group(1) if outcome_m else "UNPARSED"
-    # REASONING is everything after REASONING: up to CALLERS_OF: or EOF
+    # REASONING is everything after REASONING: up to CALLERS_OF:,
+    # ADDITIONAL_FINDING:, or EOF
     reason_m = re.search(
-        r"REASONING:\s*(.+?)(?=\n\s*CALLERS_OF:|\Z)",
+        r"REASONING:\s*(.+?)(?=\n\s*CALLERS_OF:|\n\s*ADDITIONAL_FINDING:|\Z)",
         raw, re.DOTALL,
     )
     reasoning = reason_m.group(1).strip() if reason_m else ""
-    callers_m = re.search(r"CALLERS_OF:\s*(.+?)(?:\n|$)", raw)
+    callers_m = re.search(
+        r"CALLERS_OF:\s*(.+?)(?=\n\s*ADDITIONAL_FINDING:|\n|$)", raw,
+    )
     callers_of = callers_m.group(1).strip() if callers_m else ""
+    # ADDITIONAL_FINDING is free-form — the model may put a multi-line
+    # description or a compact one-liner.  Capture everything up to EOF.
+    additional_m = re.search(
+        r"ADDITIONAL_FINDING:\s*(.+?)\Z", raw, re.DOTALL,
+    )
+    additional = additional_m.group(1).strip() if additional_m else ""
     return {
         "outcome": outcome,
         "reasoning": reasoning,
         "callers_of": callers_of,
+        "additional_finding": additional,
         "raw": raw,
     }
 
