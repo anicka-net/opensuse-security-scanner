@@ -2042,3 +2042,54 @@ def test_clean_files_recomputed_after_fp_drops(tmp_path, monkeypatch):
         f"forwarded-but-cleared file missing from clean_files: {result.clean_files}"
     )
     assert "always_clean.c" in result.clean_files
+
+
+def test_triage_only_keeps_forwarded_out_of_clean(tmp_path, monkeypatch):
+    """--triage-only must NOT mark forwarded (unanalyzed) files as clean.
+
+    Regression: after recompute_clean_files() was added for later pipeline
+    returns, the triage-only path erroneously called it with triage_findings
+    alone, which ignored triage_forwarded and put unanalyzed files in the
+    clean list.
+    """
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "forwarded.c").write_text("int main() { return 0; }\n")
+    (source_dir / "really_clean.c").write_text("int ok() { return 0; }\n")
+
+    class FailOnlyBigTriage(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            label = user.splitlines()[0].removeprefix("SOURCE FILE: ")
+            filename = label.split(" (part ", 1)[0].split("::", 1)[0]
+            if "forwarded.c" in filename:
+                return "[ERROR: context exceeded]"
+            return "CLEAN"
+        def __repr__(self):
+            return "test/fail-triage-only"
+
+    monkeypatch.setattr(
+        scan, "parse_backend_spec",
+        lambda spec: FailOnlyBigTriage(),
+    )
+
+    args = Namespace(
+        source_dir=str(source_dir),
+        obs_package=None,
+        package_name="pkg",
+        output=str(tmp_path / "report.md"),
+        json=None,
+        scratch_dir=str(tmp_path / "scratch"),
+        profile="c_cpp",
+        triage="test/fail-triage-only",
+        reasoning=None,
+        verdict=None,
+        triage_only=True,
+    )
+    result = scan.run_pipeline(args)
+
+    # forwarded.c was not analyzed past triage — it must NOT be in clean_files.
+    assert "forwarded.c" not in result.clean_files, (
+        f"unanalyzed forwarded file wrongly in clean_files: {result.clean_files}"
+    )
+    # really_clean.c got a CLEAN verdict from triage, so it IS clean.
+    assert "really_clean.c" in result.clean_files

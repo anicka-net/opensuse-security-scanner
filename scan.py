@@ -2280,14 +2280,24 @@ DESCRIPTION: {description}
 
 PREVIOUS REASONING: {reasoning}
 
-Here are call sites found in other files for the function(s) you asked about:
+Below are heuristic cross-file references (grep-based lines that mention
+the requested symbols). They are NOT verified call edges — a line that
+looks like a call may be a comment, a declaration, a string literal, a
+same-name symbol in a different namespace, or a match inside an unrelated
+macro. Use them only as auxiliary context: if a reference is genuinely
+a call with attacker-reachable input, it supports CONFIRMED; if every
+candidate reference is ambiguous or non-callable, that does NOT by
+itself prove the sink is unreachable.
 
 {callers}
 
-Given these callers, finalize your evaluation:
+Given these references, finalize your evaluation:
 
 OUTCOME: CONFIRMED | FALSE_POSITIVE
-REASONING: <why — trace from the callers' untrusted input to the sink>
+REASONING: <why — if CONFIRMED, name the specific reference line that
+            represents a real call and trace untrusted input from there
+            to the sink. If FALSE_POSITIVE, explain what rules out
+            exploitation without over-trusting the grep results.>
 """
 
 
@@ -2927,7 +2937,10 @@ def run_pipeline(args) -> ScanResult:
 
     if args.triage_only:
         result.findings = triage_findings
-        recompute_clean_files(triage_findings)
+        # Do NOT call recompute_clean_files here: forwarded files have not
+        # been analyzed past triage, so they must stay excluded from
+        # clean_files.  The flagged_files block above already set
+        # result.clean_files correctly (triage findings ∪ forwarded).
         result.stage_stats = compute_stage_stats(session_dir)
         return result
 
