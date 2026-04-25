@@ -2158,7 +2158,7 @@ def test_format_contracts_prompt_empty():
     assert scan.format_contracts_prompt([]) == ""
 
 
-def test_apply_contract_prefilter_dismisses_matching():
+def test_apply_contract_annotations_matching():
     pack = scan.load_contract_pack("pam")
     finding = scan.Finding(
         severity="High", location="_unix_getpwnam",
@@ -2166,13 +2166,13 @@ def test_apply_contract_prefilter_dismisses_matching():
         description="use-after-free: pointer freed via _pam_drop is later dereferenced",
         exploitation="", file="pam_unix.c", model="test", stage="triage",
     )
-    kept, dismissed = scan.apply_contract_prefilter([finding], [pack])
-    assert len(kept) == 0
-    assert len(dismissed) == 1
-    assert dismissed[0]["contract_symbol"] == "_pam_drop"
+    annotations = scan.apply_contract_annotations([finding], [pack])
+    assert finding.key() in annotations
+    assert "_pam_drop" in annotations[finding.key()]
+    assert "aliasing" in annotations[finding.key()]
 
 
-def test_apply_contract_prefilter_keeps_unrelated():
+def test_apply_contract_annotations_unrelated():
     pack = scan.load_contract_pack("pam")
     finding = scan.Finding(
         severity="High", location="_strbuf_reserve",
@@ -2180,12 +2180,11 @@ def test_apply_contract_prefilter_keeps_unrelated():
         description="doubling branch does not account for existing length",
         exploitation="", file="pam_env.c", model="test", stage="triage",
     )
-    kept, dismissed = scan.apply_contract_prefilter([finding], [pack])
-    assert len(kept) == 1
-    assert len(dismissed) == 0
+    annotations = scan.apply_contract_annotations([finding], [pack])
+    assert finding.key() not in annotations
 
 
-def test_apply_contract_prefilter_requires_both_symbol_and_pattern():
+def test_apply_contract_annotations_requires_both_symbol_and_pattern():
     pack = scan.load_contract_pack("pam")
     finding = scan.Finding(
         severity="High", location="check_auth",
@@ -2193,12 +2192,11 @@ def test_apply_contract_prefilter_requires_both_symbol_and_pattern():
         description="use-after-free in authentication handler",
         exploitation="", file="pam_unix.c", model="test", stage="triage",
     )
-    kept, dismissed = scan.apply_contract_prefilter([finding], [pack])
-    assert len(kept) == 1
-    assert len(dismissed) == 0
+    annotations = scan.apply_contract_annotations([finding], [pack])
+    assert finding.key() not in annotations
 
 
-def test_apply_contract_prefilter_debug_macro():
+def test_apply_contract_annotations_debug_macro():
     pack = scan.load_contract_pack("pam")
     finding = scan.Finding(
         severity="Medium", location="do_auth",
@@ -2206,10 +2204,9 @@ def test_apply_contract_prefilter_debug_macro():
         description="format string vulnerability in D() debug macro — attacker input reaches printf",
         exploitation="", file="pam_unix.c", model="test", stage="triage",
     )
-    kept, dismissed = scan.apply_contract_prefilter([finding], [pack])
-    assert len(kept) == 0
-    assert len(dismissed) == 1
-    assert dismissed[0]["contract_symbol"] == "D("
+    annotations = scan.apply_contract_annotations([finding], [pack])
+    assert finding.key() in annotations
+    assert "D(" in annotations[finding.key()]
 
 
 def test_load_contract_packs_none():
@@ -2286,10 +2283,13 @@ def test_classify_file_path_tests_by_dir():
 
 
 def test_classify_file_path_tests_by_filename():
-    assert scan.classify_file_path("modules/pam_selinux/pam_selinux_check.c") == "test"
     assert scan.classify_file_path("src/tst-overflow.c") == "test"
-    assert scan.classify_file_path("src/check_password.c") == "test"
-    assert scan.classify_file_path("lib/auth-retval.c") == "test"
+    # Filename-only patterns like *_check.c and check_* were removed
+    # (too aggressive — would suppress auth_check.c, integrity_check.c).
+    # These now classify as production; use directory or build metadata.
+    assert scan.classify_file_path("modules/pam_selinux/pam_selinux_check.c") == "production"
+    assert scan.classify_file_path("src/check_password.c") == "production"
+    assert scan.classify_file_path("lib/auth-retval.c") == "production"
 
 
 def test_classify_file_path_benchmarks():
@@ -2678,7 +2678,7 @@ def test_format_hints_prompt_none():
     assert scan.format_hints_prompt(None) == ""
 
 
-def test_apply_hints_prefilter_dismisses():
+def test_apply_hints_annotations_matching():
     hints = scan.PackageHints(
         facts=[],
         dismiss_patterns=[re.compile(r"pam_selinux_check", re.IGNORECASE)],
@@ -2690,13 +2690,12 @@ def test_apply_hints_prefilter_dismisses():
         description="setuid binary allows privilege escalation",
         exploitation="", file="pam_selinux_check.c", model="test", stage="triage",
     )
-    kept, dismissed = scan.apply_hints_prefilter([finding], hints)
-    assert len(kept) == 0
-    assert len(dismissed) == 1
-    assert "pam_selinux_check" in dismissed[0]["hint_pattern"]
+    annotations = scan.apply_hints_annotations([finding], hints)
+    assert finding.key() in annotations
+    assert "pam_selinux_check" in annotations[finding.key()]
 
 
-def test_apply_hints_prefilter_keeps_unmatched():
+def test_apply_hints_annotations_unmatched():
     hints = scan.PackageHints(
         facts=[],
         dismiss_patterns=[re.compile(r"pam_selinux_check", re.IGNORECASE)],
@@ -2708,20 +2707,18 @@ def test_apply_hints_prefilter_keeps_unmatched():
         description="doubling branch overflow",
         exploitation="", file="pam_env.c", model="test", stage="triage",
     )
-    kept, dismissed = scan.apply_hints_prefilter([finding], hints)
-    assert len(kept) == 1
-    assert len(dismissed) == 0
+    annotations = scan.apply_hints_annotations([finding], hints)
+    assert finding.key() not in annotations
 
 
-def test_apply_hints_prefilter_none_hints():
+def test_apply_hints_annotations_none():
     finding = scan.Finding(
         severity="High", location="func",
         type="overflow", description="x",
         exploitation="", file="a.c", model="test", stage="triage",
     )
-    kept, dismissed = scan.apply_hints_prefilter([finding], None)
-    assert len(kept) == 1
-    assert len(dismissed) == 0
+    annotations = scan.apply_hints_annotations([finding], None)
+    assert annotations == {}
 
 
 # ── Regression corpus tests ──────��───────────────────────────────────

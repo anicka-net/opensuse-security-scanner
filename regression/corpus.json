@@ -8,7 +8,7 @@
       "severity": "Critical",
       "location": "_strbuf_reserve",
       "type": "heap-overflow",
-      "description": "Doubling branch computes s = size * 2 and checks s >= add + 1, but does NOT check s >= len + add + 1. When buffer is nearly full (len ≈ size) and add is moderate, the realloc'd region is too small. Concrete tuple: len=500, size=512, add=100 → s=1024, need=601, but existing data occupies 500 bytes so only 524 free — not enough for 100 + NUL."
+      "description": "Doubling branch computes s = size * 2 and checks s >= add + 1, but does NOT check s >= len + add + 1. When buffer is nearly full (len ≈ size) and add is moderate, the realloc'd region is too small. Concrete tuple: len=500, size=512, add=100 → while(512 < 101) is false, so s stays 512. No realloc. But len+add+1 = 601 > 512, so the subsequent write overflows by 89 bytes."
     },
     "snippet": "static int _strbuf_reserve(strbuf *buf, size_t add) {\n    size_t s = buf->size;\n    if (s == 0) s = add + 1;\n    while (s < add + 1) s *= 2;\n    if (s != buf->size) {\n        char *p = realloc(buf->buf, s);\n        if (!p) return -1;\n        buf->buf = p;\n        buf->size = s;\n    }\n    return 0;\n}"
   },
@@ -123,7 +123,7 @@
   },
   {
     "id": "pam_timestamp_hmac_real",
-    "expected_verdict": "REPORT",
+    "expected_verdict": "REPORT_IF_CONFIGURED",
     "package": "linux-pam-1.7.2",
     "file": "modules/pam_timestamp/hmac_openssl_wrapper.c",
     "finding": {

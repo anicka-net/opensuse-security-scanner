@@ -131,10 +131,6 @@ _NONPROD_DIR_PATTERNS = (
 
 _NONPROD_FILENAME_PATTERNS = [
     re.compile(r"^tst[-_]"),
-    re.compile(r"[-_]check\.c$"),
-    re.compile(r"^check[-_]"),
-    re.compile(r"[-_]test\.c$"),
-    re.compile(r"[-_]retval\.c$"),
     re.compile(r"[-_]example\."),
     re.compile(r"[-_]demo\."),
     re.compile(r"^example[-_.]"),
@@ -269,41 +265,35 @@ def format_contracts_prompt(entries: List[ContractEntry]) -> str:
     return "\n".join(lines)
 
 
-def apply_contract_prefilter(
+def apply_contract_annotations(
     findings: List["Finding"], packs: List[ContractPack],
-) -> Tuple[List["Finding"], List[dict]]:
+) -> Dict[str, str]:
+    """Annotate findings that match known contracts. Returns a dict of
+    finding_key -> annotation text.  Findings are NOT removed — the
+    annotation is injected into the confirmation prompt so the model
+    can weigh it alongside full context."""
     if not packs:
-        return findings, []
+        return {}
     all_entries = [e for p in packs for e in p.contracts]
-    kept = []
-    dismissed = []
+    annotations: Dict[str, str] = {}
     for f in findings:
         desc_lower = f.description.lower() if f.description else ""
-        matched = None
         for entry in all_entries:
             if entry.symbol.lower() not in desc_lower:
                 continue
             for pat in entry.dismiss_patterns:
                 if pat.search(desc_lower):
-                    matched = entry
+                    annotations[f.key()] = (
+                        f"\nNOTE — a known API contract may apply: "
+                        f"{entry.symbol} ({entry.kind}): {entry.behavior}  "
+                        f"Verify whether this contract fully rules out the "
+                        f"described mechanism, or whether aliasing / indirect "
+                        f"references bypass the contract.\n"
+                    )
                     break
-            if matched:
+            if f.key() in annotations:
                 break
-        if matched:
-            dismissed.append({
-                "finding_key": f.key(),
-                "finding": {
-                    "file": f.file, "severity": f.severity,
-                    "location": f.location, "type": f.type,
-                    "description": f.description,
-                },
-                "contract_id": matched.id,
-                "contract_symbol": matched.symbol,
-                "reason": f"Contradicts contract: {matched.symbol} — {matched.behavior}",
-            })
-        else:
-            kept.append(f)
-    return kept, dismissed
+    return annotations
 
 
 # ── Package hints ──────────────────────────────────────────────────────
@@ -348,36 +338,27 @@ def format_hints_prompt(hints: PackageHints) -> str:
     return "\n".join(lines)
 
 
-def apply_hints_prefilter(
+def apply_hints_annotations(
     findings: List["Finding"], hints: Optional[PackageHints],
-) -> Tuple[List["Finding"], List[dict]]:
+) -> Dict[str, str]:
+    """Annotate findings that match package hint patterns. Returns a dict
+    of finding_key -> annotation text.  Findings are NOT removed."""
     if not hints or not hints.dismiss_patterns:
-        return findings, []
-    kept = []
-    dismissed = []
+        return {}
+    annotations: Dict[str, str] = {}
     for f in findings:
         desc_lower = (f.description or "").lower()
         loc_lower = (f.location or "").lower()
         text = f"{loc_lower} {desc_lower}"
-        matched_pat = None
         for pat in hints.dismiss_patterns:
             if pat.search(text):
-                matched_pat = pat.pattern
+                annotations[f.key()] = (
+                    f"\nNOTE — a package hint suggests this may be noise "
+                    f"(pattern: {pat.pattern}). Verify against the code "
+                    f"before dismissing.\n"
+                )
                 break
-        if matched_pat:
-            dismissed.append({
-                "finding_key": f.key(),
-                "finding": {
-                    "file": f.file, "severity": f.severity,
-                    "location": f.location, "type": f.type,
-                    "description": f.description,
-                },
-                "hint_pattern": matched_pat,
-                "reason": f"Matches package hint dismissal: {matched_pat}",
-            })
-        else:
-            kept.append(f)
-    return kept, dismissed
+    return annotations
 
 
 # ── Backend abstraction ─────────────────────────────────────────────────
@@ -2612,6 +2593,7 @@ def run_confirmation_pass(catchup_findings: List[Finding],
                           session_dir: Path,
                           contract_packs: Optional[List[ContractPack]] = None,
                           package_hints: Optional[PackageHints] = None,
+                          finding_annotations: Optional[Dict[str, str]] = None,
                           ) -> Dict[str, dict]:
     """Whole-file confirmation pass (pass 2) for catch-up findings.
 
@@ -2666,11 +2648,12 @@ def run_confirmation_pass(catchup_findings: List[Finding],
                 finding, source_dir, relpath,
             )
             hints_text = format_hints_prompt(package_hints) if package_hints else ""
+            annotation = (finding_annotations or {}).get(finding.key(), "")
             prompt = CONFIRMATION_PROMPT.format(
                 severity=finding.severity,
                 location=finding.location,
                 type=finding.type,
-                description=finding.description,
+                description=finding.description + annotation,
                 code=code,
                 contracts=contracts_text,
                 hints=hints_text,
@@ -3025,11 +3008,37 @@ def format_codec_directions(directions: Dict[str, str]) -> str:
 
 # ── Build/install metadata ────────────────────────────────────────────
 
-_MESON_BLOCK_RE = re.compile(
-    r"(?:executable|shared_library|static_library|install_data|install_headers)"
-    r"\s*\(\s*'([^']+)'(.*?)\)",
-    re.DOTALL,
+_MESON_FUNC_START_RE = re.compile(
+    r"(executable|shared_library|static_library|install_data|install_headers)"
+    r"\s*\(\s*'([^']+)'"
 )
+
+
+def _extract_meson_block(text: str, start: int) -> str:
+    """Extract a balanced-paren block starting from the '(' after function name."""
+    paren_pos = text.find("(", start)
+    if paren_pos < 0:
+        return ""
+    depth = 0
+    i = paren_pos
+    while i < len(text):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[paren_pos + 1:i]
+        elif ch == "#":
+            nl = text.find("\n", i)
+            i = nl if nl >= 0 else len(text)
+            continue
+        elif ch in ("'", '"'):
+            close = text.find(ch, i + 1)
+            if close >= 0:
+                i = close
+        i += 1
+    return text[paren_pos + 1:]
 
 _SPEC_ATTR_RE = re.compile(
     r"^%attr\s*\(\s*([0-7]+)\s*,\s*(\w+)\s*,\s*(\w+)\s*\)\s*(.+)$",
@@ -3049,14 +3058,16 @@ def extract_meson_install_metadata(source_dir: str) -> List[dict]:
             text = meson_file.read_text(errors="replace")
         except OSError:
             continue
-        for m in _MESON_BLOCK_RE.finditer(text):
-            name = m.group(1)
-            body = m.group(2)
+        for m in _MESON_FUNC_START_RE.finditer(text):
+            name = m.group(2)
+            body = _extract_meson_block(text, m.start())
             inst_m = re.search(r'install\s*:\s*(true|false)', body)
             if not inst_m:
                 continue
             installed = inst_m.group(1) == "true"
-            mode_m = re.search(r'install_mode\s*:\s*\[([^\]]*)\]', body)
+            mode_m = re.search(r"install_mode\s*:\s*\[([^\]]*)\]", body)
+            if not mode_m:
+                mode_m = re.search(r"install_mode\s*:\s*'([^']*)'", body)
             mode_str = mode_m.group(1).split(",")[0].strip("' \"") if mode_m else ""
             setuid = ("s" in mode_str[:4] or mode_str.startswith("4")) if mode_str else False
             results.append({
@@ -3553,49 +3564,23 @@ def run_pipeline(args) -> ScanResult:
         else:
             print("\nCatch-up: no additional findings.", flush=True)
 
-        # ── Contract pre-filter ──
+        # ── Collect annotations from contracts and hints ──
+        finding_annotations: Dict[str, str] = {}
         if catchup_findings and contract_packs:
-            catchup_findings, contract_dismissed = apply_contract_prefilter(
-                catchup_findings, contract_packs,
-            )
-            if contract_dismissed:
-                dismiss_dir = session_dir / "contract_dismissed"
-                dismiss_dir.mkdir(exist_ok=True)
-                write_json(dismiss_dir / "dismissed.json", {
-                    "stage": "contract_prefilter",
-                    "created_at": utc_now(),
-                    "dismissed": contract_dismissed,
-                })
-                print(
-                    f"\nContract pre-filter: dismissed {len(contract_dismissed)} "
-                    f"finding(s) by known API contracts",
-                    flush=True,
-                )
-                for d in contract_dismissed:
-                    print(f"    -> {d['contract_symbol']}: "
-                          f"{d['finding']['location']}", flush=True)
-
-        # ── Package hints pre-filter ──
+            contract_notes = apply_contract_annotations(catchup_findings, contract_packs)
+            if contract_notes:
+                finding_annotations.update(contract_notes)
+                print(f"\nContract annotations: {len(contract_notes)} finding(s) "
+                      f"matched known API contracts (kept for model review)",
+                      flush=True)
         if catchup_findings and package_hints:
-            catchup_findings, hints_dismissed = apply_hints_prefilter(
-                catchup_findings, package_hints,
-            )
-            if hints_dismissed:
-                dismiss_dir = session_dir / "hints_dismissed"
-                dismiss_dir.mkdir(exist_ok=True)
-                write_json(dismiss_dir / "dismissed.json", {
-                    "stage": "hints_prefilter",
-                    "created_at": utc_now(),
-                    "dismissed": hints_dismissed,
-                })
-                print(
-                    f"\nHints pre-filter: dismissed {len(hints_dismissed)} "
-                    f"finding(s) by package hints",
-                    flush=True,
-                )
-                for d in hints_dismissed:
-                    print(f"    -> {d['hint_pattern']}: "
-                          f"{d['finding']['location']}", flush=True)
+            hints_notes = apply_hints_annotations(catchup_findings, package_hints)
+            if hints_notes:
+                for k, v in hints_notes.items():
+                    finding_annotations[k] = finding_annotations.get(k, "") + v
+                print(f"\nHints annotations: {len(hints_notes)} finding(s) "
+                      f"matched package hints (kept for model review)",
+                      flush=True)
 
         # ── Stage 1c: Confirmation pass (whole-file) ──
         # For each catch-up finding, re-ask with the whole file as context.
@@ -3612,6 +3597,7 @@ def run_pipeline(args) -> ScanResult:
                 source_dir, session_dir,
                 contract_packs=contract_packs,
                 package_hints=package_hints,
+                finding_annotations=finding_annotations,
             )
             n_need_callers = sum(1 for v in confirmation.values()
                                  if v["outcome"] == "NEED_CALLERS")
@@ -3763,12 +3749,6 @@ def generate_report(result: ScanResult, output_path: str):
                 f"{stats['files_with_findings']} with findings, "
                 f"{stats['total_findings']} total findings"
             )
-        contract_dismiss_path = session_dir / "contract_dismissed" / "dismissed.json" if session_dir else None
-        if contract_dismiss_path and contract_dismiss_path.exists():
-            dismissed_data = load_json(contract_dismiss_path)
-            n_dismissed = len(dismissed_data.get("dismissed", []))
-            if n_dismissed:
-                lines.append(f"- **Contract pre-filter**: {n_dismissed} dismissed by known API contracts")
         if has_verdicts:
             counts = {k: len(v) for k, v in verdict_groups.items() if v}
             parts = []
