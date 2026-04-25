@@ -123,7 +123,7 @@
   },
   {
     "id": "pam_timestamp_hmac_real",
-    "expected_verdict": "REPORT_IF_CONFIGURED",
+    "expected_verdict": "UPSTREAM_HARDENING",
     "package": "linux-pam-1.7.2",
     "file": "modules/pam_timestamp/hmac_openssl_wrapper.c",
     "finding": {
