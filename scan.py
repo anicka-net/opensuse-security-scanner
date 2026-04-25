@@ -3023,6 +3023,120 @@ def format_codec_directions(directions: Dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+# ── Build/install metadata ────────────────────────────────────────────
+
+_MESON_BLOCK_RE = re.compile(
+    r"(?:executable|shared_library|static_library|install_data|install_headers)"
+    r"\s*\(\s*'([^']+)'(.*?)\)",
+    re.DOTALL,
+)
+
+_SPEC_ATTR_RE = re.compile(
+    r"^%attr\s*\(\s*([0-7]+)\s*,\s*(\w+)\s*,\s*(\w+)\s*\)\s*(.+)$",
+    re.MULTILINE,
+)
+_SPEC_FILES_RE = re.compile(
+    r"^(/\S+)",
+    re.MULTILINE,
+)
+
+
+def extract_meson_install_metadata(source_dir: str) -> List[dict]:
+    results = []
+    src = Path(source_dir)
+    for meson_file in sorted(src.rglob("meson.build")):
+        try:
+            text = meson_file.read_text(errors="replace")
+        except OSError:
+            continue
+        for m in _MESON_BLOCK_RE.finditer(text):
+            name = m.group(1)
+            body = m.group(2)
+            inst_m = re.search(r'install\s*:\s*(true|false)', body)
+            if not inst_m:
+                continue
+            installed = inst_m.group(1) == "true"
+            mode_m = re.search(r'install_mode\s*:\s*\[([^\]]*)\]', body)
+            mode_str = mode_m.group(1).split(",")[0].strip("' \"") if mode_m else ""
+            setuid = ("s" in mode_str[:4] or mode_str.startswith("4")) if mode_str else False
+            results.append({
+                "name": name,
+                "installed": installed,
+                "setuid": setuid,
+                "source": str(meson_file.relative_to(src)),
+            })
+    return results
+
+
+def extract_spec_install_metadata(source_dir: str) -> List[dict]:
+    results = []
+    src = Path(source_dir)
+    for spec_file in sorted(src.rglob("*.spec")):
+        try:
+            text = spec_file.read_text(errors="replace")
+        except OSError:
+            continue
+        in_files = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("%files"):
+                in_files = True
+                continue
+            if in_files and stripped.startswith("%"):
+                if not stripped.startswith("%attr") and not stripped.startswith("%dir"):
+                    in_files = False
+                    continue
+            if not in_files:
+                continue
+            attr_m = _SPEC_ATTR_RE.match(stripped)
+            if attr_m:
+                mode, user, group, path = attr_m.groups()
+                setuid = mode.startswith("4")
+                results.append({
+                    "path": path.strip(),
+                    "mode": mode,
+                    "user": user,
+                    "group": group,
+                    "setuid": setuid,
+                    "source": str(spec_file.relative_to(src)),
+                })
+            else:
+                file_m = _SPEC_FILES_RE.match(stripped)
+                if file_m:
+                    results.append({
+                        "path": file_m.group(1).strip(),
+                        "mode": "",
+                        "user": "",
+                        "group": "",
+                        "setuid": False,
+                        "source": str(spec_file.relative_to(src)),
+                    })
+    return results
+
+
+def format_install_metadata(meson_meta: List[dict],
+                            spec_meta: List[dict]) -> str:
+    if not meson_meta and not spec_meta:
+        return ""
+    lines = [
+        "\n\n// === Install metadata ===\n"
+    ]
+    if meson_meta:
+        lines.append("// From meson.build:")
+        for m in meson_meta:
+            status = "installed" if m["installed"] else "NOT installed"
+            setuid = " (SETUID)" if m["setuid"] else ""
+            lines.append(f"  {m['name']}: {status}{setuid}  ({m['source']})")
+    if spec_meta:
+        lines.append("// From RPM .spec:")
+        for s in spec_meta:
+            setuid = " (SETUID)" if s["setuid"] else ""
+            mode = f" mode={s['mode']}" if s["mode"] else ""
+            lines.append(f"  {s['path']}{mode}{setuid}  ({s['source']})")
+    lines.append("// === End install metadata ===\n")
+    return "\n".join(lines)
+
+
 _CONFIG_DEFAULT_RE = re.compile(
     r'^\s*#\s*define\s+(DEFAULT_\w+|ENABLE_\w+|DISABLE_\w+|USE_\w+|'
     r'WITH_\w+|WITHOUT_\w+|OPT_\w+|HAVE_\w+)\s+(.+?)(?:\s*/\*.*)?$',
@@ -3066,6 +3180,9 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
     caller_results = load_confirmation_results(session_dir, "triage_confirm_callers")
     config_defaults_section = extract_config_defaults(source_dir)
     codec_directions = analyze_codec_directions(source_dir)
+    meson_meta = extract_meson_install_metadata(source_dir)
+    spec_meta = extract_spec_install_metadata(source_dir)
+    install_section = format_install_metadata(meson_meta, spec_meta)
     codec_section = format_codec_directions(codec_directions)
 
     for group in consensus:
@@ -3133,6 +3250,8 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
             aux_section += config_defaults_section
         if codec_section:
             aux_section += codec_section
+        if install_section:
+            aux_section += install_section
         hints_section = format_hints_prompt(package_hints) if package_hints else ""
         if hints_section:
             aux_section += hints_section

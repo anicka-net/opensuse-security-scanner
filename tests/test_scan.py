@@ -2745,3 +2745,69 @@ def test_regression_corpus_loads():
     assert "REPORT_IF_CONFIGURED" in verdicts
     assert "NEEDS_REPRODUCER" in verdicts
     assert "UPSTREAM_HARDENING" in verdicts
+
+
+# ── Install metadata tests ───────────────────────────────────────────
+
+
+def test_extract_meson_install_metadata(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "meson.build").write_text(
+        "executable('pam_helper', 'helper.c',\n"
+        "  install: true,\n"
+        "  install_mode: ['rwsr-xr-x', 'root', 'root'],\n"
+        ")\n"
+        "executable('pam_check', 'check.c',\n"
+        "  install: false,\n"
+        ")\n"
+    )
+    meta = scan.extract_meson_install_metadata(str(src))
+    assert len(meta) == 2
+    helper = [m for m in meta if m["name"] == "pam_helper"][0]
+    assert helper["installed"] is True
+    assert helper["setuid"] is True
+    check = [m for m in meta if m["name"] == "pam_check"][0]
+    assert check["installed"] is False
+    assert check["setuid"] is False
+
+
+def test_extract_meson_no_meson(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.c").write_text("int main() {}\n")
+    assert scan.extract_meson_install_metadata(str(src)) == []
+
+
+def test_extract_spec_install_metadata(tmp_path):
+    src = tmp_path / "pkg"
+    src.mkdir()
+    (src / "pam.spec").write_text(
+        "%files\n"
+        "%attr(4755,root,root) /usr/sbin/unix_chkpwd\n"
+        "/usr/lib64/security/pam_unix.so\n"
+        "%attr(0755,root,root) /usr/libexec/pam_helper\n"
+        "\n"
+        "%changelog\n"
+    )
+    meta = scan.extract_spec_install_metadata(str(src))
+    assert len(meta) == 3
+    chkpwd = [m for m in meta if "unix_chkpwd" in m["path"]][0]
+    assert chkpwd["setuid"] is True
+    assert chkpwd["mode"] == "4755"
+    helper = [m for m in meta if "pam_helper" in m["path"]][0]
+    assert helper["setuid"] is False
+
+
+def test_format_install_metadata():
+    meson = [{"name": "helper", "installed": True, "setuid": True, "source": "meson.build"}]
+    spec = [{"path": "/usr/sbin/prog", "mode": "4755", "user": "root",
+             "group": "root", "setuid": True, "source": "pkg.spec"}]
+    result = scan.format_install_metadata(meson, spec)
+    assert "Install metadata" in result
+    assert "helper: installed (SETUID)" in result
+    assert "/usr/sbin/prog" in result
+
+
+def test_format_install_metadata_empty():
+    assert scan.format_install_metadata([], []) == ""
