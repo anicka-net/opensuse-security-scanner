@@ -2551,3 +2551,93 @@ def test_verdict_prompt_has_actionability_labels():
         assert "CONFIRMED|FALSE_POSITIVE|NEEDS_CONTEXT" not in vpt, (
             f"Profile {name} still has old verdict labels"
         )
+
+
+def test_verdict_prompt_has_reachability_triad():
+    """All profiles require SOURCE_OWNER, CONFIG_GATE, SINK_PRIVILEGE."""
+    for name in scan.available_profile_names():
+        profile = scan.load_profile(name)
+        vpt = profile.verdict_prompt_template
+        assert "SOURCE_OWNER:" in vpt, f"Profile {name} missing SOURCE_OWNER"
+        assert "CONFIG_GATE:" in vpt, f"Profile {name} missing CONFIG_GATE"
+        assert "SINK_PRIVILEGE:" in vpt, f"Profile {name} missing SINK_PRIVILEGE"
+
+
+def test_extract_config_defaults(tmp_path):
+    """Config defaults scanner finds DEFAULT_* and similar macros."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "config.h").write_text(
+        '#define DEFAULT_USER_READ_ENVFILE 0\n'
+        '#define DEFAULT_RETRY_COUNT 3\n'
+        '#define ENABLE_DEBUG 0\n'
+        'int x = 5;\n'
+    )
+    (src / "main.c").write_text(
+        '#include "config.h"\n'
+        '#define USE_FEATURE_X 1\n'
+        'int main() { return 0; }\n'
+    )
+    result = scan.extract_config_defaults(str(src))
+    assert "DEFAULT_USER_READ_ENVFILE = 0" in result
+    assert "DEFAULT_RETRY_COUNT = 3" in result
+    assert "ENABLE_DEBUG = 0" in result
+    assert "USE_FEATURE_X = 1" in result
+    assert "int x" not in result
+
+
+def test_extract_config_defaults_empty(tmp_path):
+    """No macros found returns empty string."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.c").write_text("int main() { return 0; }\n")
+    assert scan.extract_config_defaults(str(src)) == ""
+
+
+# ── Codec direction tests ────────────────────────────────────────────
+
+
+def test_analyze_codec_encode_only(tmp_path):
+    """XDR function used only as encoder in clnt_call."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "nis.c").write_text(
+        'clnt_call(clnt, YPPASSWDPROC_UPDATE,\n'
+        '    (xdrproc_t) xdr_yppasswd, &yppwd,\n'
+        '    (xdrproc_t) xdr_int, &status,\n'
+        '    timeout);\n'
+    )
+    dirs = scan.analyze_codec_directions(str(src))
+    assert dirs.get("xdr_yppasswd") == "encode"
+    assert dirs.get("xdr_int") == "decode"
+
+
+def test_analyze_codec_explicit_direction(tmp_path):
+    """Explicit XDR_ENCODE/XDR_DECODE markers."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "codec.c").write_text(
+        'xdrmem_create(&xdr, buf, len, XDR_ENCODE);\n'
+        'xdr_mytype(&xdr, &data);\n'
+    )
+    dirs = scan.analyze_codec_directions(str(src))
+    assert dirs.get("xdr_mytype") == "encode"
+
+
+def test_analyze_codec_no_codecs(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.c").write_text("int main() { return 0; }\n")
+    assert scan.analyze_codec_directions(str(src)) == {}
+
+
+def test_format_codec_directions():
+    dirs = {"xdr_yppasswd": "encode", "xdr_int": "decode"}
+    result = scan.format_codec_directions(dirs)
+    assert "xdr_yppasswd: encode" in result
+    assert "xdr_int: decode" in result
+    assert "Codec direction" in result
+
+
+def test_format_codec_directions_empty():
+    assert scan.format_codec_directions({}) == ""

@@ -2872,6 +2872,112 @@ def _looks_like_cross_reference(content: str, term: str) -> bool:
     return True
 
 
+# ── Codec direction analysis ──────────────────────────────────────────
+
+_CODEC_FUNC_RE = re.compile(r'\b(xdr_\w+|asn1_\w+|ber_\w+|der_\w+)\b')
+
+_XDR_ENCODE_PATTERNS = [
+    re.compile(r'\bclnt_call\s*\([^,]+,\s*\w+\s*,\s*\(\s*xdrproc_t\s*\)\s*(\w+)'),
+    re.compile(r'\bXDR_ENCODE\b'),
+    re.compile(r'\bxdrmem_create\s*\([^)]*XDR_ENCODE'),
+    re.compile(r'\bxdrrec_create\s*\([^)]*XDR_ENCODE'),
+]
+
+_XDR_DECODE_PATTERNS = [
+    re.compile(r'\bclnt_call\s*\([^,]+,[^,]+,[^,]+,[^,]+,\s*\(\s*xdrproc_t\s*\)\s*(\w+)'),
+    re.compile(r'\bXDR_DECODE\b'),
+    re.compile(r'\bxdrmem_create\s*\([^)]*XDR_DECODE'),
+    re.compile(r'\bxdr_replymsg\b'),
+]
+
+
+def analyze_codec_directions(source_dir: str) -> Dict[str, str]:
+    results: Dict[str, str] = {}
+    src = Path(source_dir)
+    for p in sorted(src.rglob("*.[ch]")):
+        try:
+            text = p.read_text(errors="replace")
+        except OSError:
+            continue
+        codec_funcs = set(_CODEC_FUNC_RE.findall(text))
+        if not codec_funcs:
+            continue
+        for func in codec_funcs:
+            if func in results:
+                continue
+            is_encoder = any(
+                func in (m.group(1) if m.lastindex else "")
+                for pat in _XDR_ENCODE_PATTERNS
+                for m in pat.finditer(text)
+            ) or any(
+                pat.search(text) and func in text
+                for pat in _XDR_ENCODE_PATTERNS
+                if not pat.groups
+            )
+            is_decoder = any(
+                func in (m.group(1) if m.lastindex else "")
+                for pat in _XDR_DECODE_PATTERNS
+                for m in pat.finditer(text)
+            ) or any(
+                pat.search(text) and func in text
+                for pat in _XDR_DECODE_PATTERNS
+                if not pat.groups
+            )
+            if is_encoder and is_decoder:
+                results[func] = "both"
+            elif is_encoder:
+                results[func] = "encode"
+            elif is_decoder:
+                results[func] = "decode"
+    return results
+
+
+def format_codec_directions(directions: Dict[str, str]) -> str:
+    if not directions:
+        return ""
+    lines = [
+        "\n\n// === Codec direction analysis ===\n"
+        "// Usage direction of XDR/ASN.1 codec functions in this package.\n"
+        "// Decode-side bugs do NOT apply to encode-only usage.\n"
+    ]
+    for func, direction in sorted(directions.items()):
+        lines.append(f"  {func}: {direction}")
+    lines.append("// === End codec direction analysis ===\n")
+    return "\n".join(lines)
+
+
+_CONFIG_DEFAULT_RE = re.compile(
+    r'^\s*#\s*define\s+(DEFAULT_\w+|ENABLE_\w+|DISABLE_\w+|USE_\w+|'
+    r'WITH_\w+|WITHOUT_\w+|OPT_\w+|HAVE_\w+)\s+(.+?)(?:\s*/\*.*)?$',
+    re.MULTILINE,
+)
+
+
+def extract_config_defaults(source_dir: str) -> str:
+    defaults = []
+    seen = set()
+    src = Path(source_dir)
+    for p in sorted(src.rglob("*.[ch]")):
+        try:
+            text = p.read_text(errors="replace")
+        except OSError:
+            continue
+        for m in _CONFIG_DEFAULT_RE.finditer(text):
+            macro, value = m.group(1), m.group(2).strip()
+            if macro in seen:
+                continue
+            seen.add(macro)
+            relpath = str(p.relative_to(src))
+            defaults.append(f"  {macro} = {value}  ({relpath})")
+    if not defaults:
+        return ""
+    return (
+        "\n\n// === Package config defaults (from source #define) ===\n"
+        + "\n".join(defaults[:50])
+        + "\n// === End config defaults ===\n"
+    )
+
+
 def run_verdict_stage(consensus: List[dict], backend: Backend,
                       source_dir: str, session_dir: Path,
                       profile_by_file: dict) -> List[dict]:
@@ -2879,6 +2985,9 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
     # Load any confirmation-pass outputs so we can show them to verdict
     confirm_results = load_confirmation_results(session_dir, "triage_confirm")
     caller_results = load_confirmation_results(session_dir, "triage_confirm_callers")
+    config_defaults_section = extract_config_defaults(source_dir)
+    codec_directions = analyze_codec_directions(source_dir)
+    codec_section = format_codec_directions(codec_directions)
 
     for group in consensus:
         filepath = Path(source_dir) / group["findings"][0].file
@@ -2941,6 +3050,10 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
                 + "\n\n".join(confirm_notes) +
                 "\n// === End confirmation pass notes ===\n"
             )
+        if config_defaults_section:
+            aux_section += config_defaults_section
+        if codec_section:
+            aux_section += codec_section
 
         prompt = profile.verdict_prompt_template.format(
             filename=group["findings"][0].file,
@@ -2972,8 +3085,20 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
         severity_match = re.search(r"REAL_SEVERITY:\s*(Critical|High|Medium|Low|None)", raw)
         group["real_severity"] = severity_match.group(1) if severity_match else None
 
+        source_m = re.search(r"SOURCE_OWNER:\s*(\S+)", raw)
+        group["source_owner"] = source_m.group(1) if source_m else ""
+        config_m = re.search(r"CONFIG_GATE:\s*(\S+)", raw)
+        group["config_gate"] = config_m.group(1) if config_m else ""
+        sink_m = re.search(r"SINK_PRIVILEGE:\s*(\S+)", raw)
+        group["sink_privilege"] = sink_m.group(1) if sink_m else ""
+
         status = group["verdict"]
-        print(f"  {group['findings'][0].file}: {status}", flush=True)
+        triad = ""
+        if group["source_owner"] or group["config_gate"] or group["sink_privilege"]:
+            triad = (f" [{group['source_owner'] or '?'} / "
+                     f"{group['config_gate'] or '?'} / "
+                     f"{group['sink_privilege'] or '?'}]")
+        print(f"  {group['findings'][0].file}: {status}{triad}", flush=True)
         save_verdict_output(session_dir, group)
 
     return consensus
@@ -3496,6 +3621,17 @@ def _format_verdict_finding(lines: list, payload: dict):
     lines.append(f"**Stages**: {stage_str}")
     if payload.get("real_severity"):
         lines.append(f"**Final severity**: {payload['real_severity']}")
+
+    triad_parts = []
+    if payload.get("source_owner"):
+        triad_parts.append(f"Source: {payload['source_owner']}")
+    if payload.get("config_gate"):
+        triad_parts.append(f"Config: {payload['config_gate']}")
+    if payload.get("sink_privilege"):
+        triad_parts.append(f"Privilege: {payload['sink_privilege']}")
+    if triad_parts:
+        lines.append(f"**Reachability**: {' | '.join(triad_parts)}")
+
     if finding.get("source"):
         lines.append(f"**Source**: {finding['source']}")
     if finding.get("sink"):
