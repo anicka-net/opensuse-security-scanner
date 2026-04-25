@@ -1,0 +1,137 @@
+[
+  {
+    "id": "strbuf_reserve_real",
+    "expected_verdict": "REPORT_IF_CONFIGURED",
+    "package": "linux-pam-1.7.2",
+    "file": "modules/pam_env/pam_env.c",
+    "finding": {
+      "severity": "Critical",
+      "location": "_strbuf_reserve",
+      "type": "heap-overflow",
+      "description": "Doubling branch computes s = size * 2 and checks s >= add + 1, but does NOT check s >= len + add + 1. When buffer is nearly full (len ≈ size) and add is moderate, the realloc'd region is too small. Concrete tuple: len=500, size=512, add=100 → s=1024, need=601, but existing data occupies 500 bytes so only 524 free — not enough for 100 + NUL."
+    },
+    "snippet": "static int _strbuf_reserve(strbuf *buf, size_t add) {\n    size_t s = buf->size;\n    if (s == 0) s = add + 1;\n    while (s < add + 1) s *= 2;\n    if (s != buf->size) {\n        char *p = realloc(buf->buf, s);\n        if (!p) return -1;\n        buf->buf = p;\n        buf->size = s;\n    }\n    return 0;\n}"
+  },
+  {
+    "id": "strbuf_add_char_fp",
+    "expected_verdict": "NOISE",
+    "package": "linux-pam-1.7.2",
+    "file": "modules/pam_env/pam_env.c",
+    "finding": {
+      "severity": "High",
+      "location": "_strbuf_add_char",
+      "type": "off-by-one",
+      "description": "Off-by-one: _strbuf_add_char reserves 1 byte but does not account for the existing NUL terminator being overwritten."
+    },
+    "snippet": "static int _strbuf_add_char(strbuf *buf, char c) {\n    if (_strbuf_reserve(buf, 1) != 0) return -1;\n    buf->buf[buf->len++] = c;\n    buf->buf[buf->len] = '\\0';\n    return 0;\n}",
+    "why_noise": "_strbuf_reserve(buf, 1) ensures space for 1 additional byte plus NUL. The add_char function correctly writes c at [len] and NUL at [len+1], both within the reserved space."
+  },
+  {
+    "id": "pam_xauth_getline_real",
+    "expected_verdict": "REPORT_IF_CONFIGURED",
+    "package": "linux-pam-1.7.2",
+    "file": "modules/pam_xauth/pam_xauth.c",
+    "finding": {
+      "severity": "Medium",
+      "location": "pam_sm_open_session / getline",
+      "type": "denial-of-service",
+      "description": "getline() after regain_priv() reads from ~/.Xauthority with no size limit. A malicious user can create a multi-GB .Xauthority file, causing the PAM module (running as root after regain_priv) to allocate unbounded memory."
+    },
+    "snippet": "/* after regaining root privileges */\nFILE *fp = fopen(xauth_file, \"r\");\nwhile (getline(&line, &len, fp) != -1) {\n    /* process xauth entries */\n}"
+  },
+  {
+    "id": "account_utils_verify_password_real",
+    "expected_verdict": "REPORT",
+    "package": "account-utils-1.1.0",
+    "file": "libcommon/verify.c",
+    "finding": {
+      "severity": "High",
+      "location": "verify_password",
+      "type": "null-pointer-dereference",
+      "description": "strdup(crypt_r(password, salt, &data)) crashes on NULL return from crypt_r. crypt_r returns NULL on invalid salt prefix or memory allocation failure. This is reachable through PAM auth path."
+    },
+    "snippet": "int verify_password(const char *password, const char *hash) {\n    struct crypt_data data;\n    memset(&data, 0, sizeof(data));\n    char *result = strdup(crypt_r(password, hash, &data));\n    /* strdup(NULL) → SIGSEGV */\n    int ok = strcmp(result, hash) == 0;\n    free(result);\n    return ok;\n}"
+  },
+  {
+    "id": "pam_drop_uaf_fp",
+    "expected_verdict": "NOISE",
+    "package": "linux-pam-1.7.2",
+    "file": "modules/pam_unix/pam_unix_auth.c",
+    "finding": {
+      "severity": "Critical",
+      "location": "_unix_getpwnam",
+      "type": "use-after-free",
+      "description": "use-after-free: pointer freed via _pam_drop is later dereferenced in authentication path"
+    },
+    "snippet": "_pam_drop(pwd);\n/* ... later ... */\nif (pwd != NULL) { use(pwd); }",
+    "why_noise": "_pam_drop(pwd) calls free(pwd) then sets pwd = NULL. The subsequent NULL check correctly guards the dereference. This is a NULL-deref crash at worst (not exploitable UAF), but the NULL check prevents even that."
+  },
+  {
+    "id": "pam_set_item_uaf_fp",
+    "expected_verdict": "NOISE",
+    "package": "linux-pam-1.7.2",
+    "file": "modules/pam_unix/pam_unix_passwd.c",
+    "finding": {
+      "severity": "High",
+      "location": "set_password",
+      "type": "use-after-free",
+      "description": "Buffer passed to pam_set_item is freed, but PAM handle retains a dangling reference to it."
+    },
+    "snippet": "char *newpass = strdup(password);\npam_set_item(pamh, PAM_AUTHTOK, newpass);\nfree(newpass);",
+    "why_noise": "pam_set_item() deep-copies its data argument via strdup. The PAM handle holds an independent copy. Freeing the original buffer does not create a dangling reference."
+  },
+  {
+    "id": "pam_namespace_opendir_real",
+    "expected_verdict": "NEEDS_REPRODUCER",
+    "package": "linux-pam-1.7.2",
+    "file": "modules/pam_namespace/pam_namespace.c",
+    "finding": {
+      "severity": "Medium",
+      "location": "secure_opendir",
+      "type": "logic-error",
+      "description": "Final path segment: if protect_mount fails, function returns the unprotected fd instead of erroring. Attacker who can create a mount point at the final segment of a namespace path could bypass the protection."
+    },
+    "snippet": "for each segment:\n    fd = openat(parent, segment, O_NOFOLLOW|O_DIRECTORY);\n    if (is_last_segment) {\n        if (protect_mount(fd) < 0) {\n            /* BUG: falls through, returns fd */\n        }\n    }"
+  },
+  {
+    "id": "xdr_yppasswd_fp",
+    "expected_verdict": "NOISE",
+    "package": "linux-pam-1.7.2",
+    "file": "modules/pam_unix/yppasswd_xdr.c",
+    "finding": {
+      "severity": "High",
+      "location": "xdr_yppasswd",
+      "type": "integer-overflow",
+      "description": "Integer overflow in xdr_yppasswd when decoding attacker-controlled NIS response data."
+    },
+    "snippet": "bool_t xdr_yppasswd(XDR *xdrs, struct yppasswd *objp) {\n    if (!xdr_string(xdrs, &objp->newpw.pw_name, ~0)) return FALSE;\n    ...\n}",
+    "why_noise": "linux-pam uses xdr_yppasswd only as an encoder in clnt_call (second xdrproc_t arg = outgoing). The integer overflow only triggers on XDR_DECODE direction. Encode-only usage is safe."
+  },
+  {
+    "id": "libpamc_bp_renew_dormant",
+    "expected_verdict": "UPSTREAM_HARDENING",
+    "package": "linux-pam-1.7.2",
+    "file": "libpamc/include/security/pam_client.h",
+    "finding": {
+      "severity": "High",
+      "location": "PAM_BP_RENEW",
+      "type": "integer-overflow",
+      "description": "PAM_BP_RENEW macro: agent_id_length is extracted from an agent-controlled binary protocol message without validation. Integer overflow in size calculation leads to undersized allocation."
+    },
+    "snippet": "#define PAM_BP_RENEW(bp, cntrl, agent_id_length, data_mark) ...\n    bp = calloc(1, PAM_BP_MIN_SIZE + agent_id_length + (data_mark));",
+    "why_upstream_hardening": "libpamc.so has zero consumers on openSUSE (verified via ldd scan). The vulnerability is real in the code but dormant because no installed binary links against the library."
+  },
+  {
+    "id": "pam_timestamp_hmac_real",
+    "expected_verdict": "REPORT",
+    "package": "linux-pam-1.7.2",
+    "file": "modules/pam_timestamp/hmac_openssl_wrapper.c",
+    "finding": {
+      "severity": "Medium",
+      "location": "hmac_openssl_wrapper",
+      "type": "integrity-bypass",
+      "description": "Key length confusion between hmac_key_read (returns bytes read as int count) and HMAC callers (interpret it as key material length). If key file is shorter than expected, HMAC uses partial key, weakening timestamp integrity verification."
+    },
+    "snippet": "int count = hmac_key_read(fd, key, sizeof(key));\n/* count = bytes read, but callers treat it as 'key is valid' flag */\nHMAC(EVP_sha1(), key, sizeof(key), ...);"
+  }
+]

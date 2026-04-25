@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import sys
 from argparse import Namespace
@@ -2641,3 +2642,106 @@ def test_format_codec_directions():
 
 def test_format_codec_directions_empty():
     assert scan.format_codec_directions({}) == ""
+
+
+# ── Package hints tests ──────────────────────────────────────────────
+
+
+def test_load_package_hints(tmp_path):
+    hints_file = tmp_path / ".scanner-hints.toml"
+    hints_file.write_text(
+        'facts = ["ROOT_USER = 0 is a constant", "libpamc has no consumers"]\n'
+        'dismiss = ["libpamc.*PAM_BP", "pam_selinux_check"]\n'
+    )
+    hints = scan.load_package_hints(str(tmp_path))
+    assert hints is not None
+    assert len(hints.facts) == 2
+    assert len(hints.dismiss_patterns) == 2
+    assert "ROOT_USER" in hints.facts[0]
+
+
+def test_load_package_hints_missing(tmp_path):
+    assert scan.load_package_hints(str(tmp_path)) is None
+
+
+def test_format_hints_prompt():
+    hints = scan.PackageHints(
+        facts=["ROOT_USER = 0 is uid 0", "D() is debug-only"],
+        dismiss_patterns=[], raw_dismissals=[],
+    )
+    result = scan.format_hints_prompt(hints)
+    assert "PACKAGE-SPECIFIC FACTS" in result
+    assert "ROOT_USER" in result
+
+
+def test_format_hints_prompt_none():
+    assert scan.format_hints_prompt(None) == ""
+
+
+def test_apply_hints_prefilter_dismisses():
+    hints = scan.PackageHints(
+        facts=[],
+        dismiss_patterns=[re.compile(r"pam_selinux_check", re.IGNORECASE)],
+        raw_dismissals=["pam_selinux_check"],
+    )
+    finding = scan.Finding(
+        severity="High", location="pam_selinux_check",
+        type="privilege-escalation",
+        description="setuid binary allows privilege escalation",
+        exploitation="", file="pam_selinux_check.c", model="test", stage="triage",
+    )
+    kept, dismissed = scan.apply_hints_prefilter([finding], hints)
+    assert len(kept) == 0
+    assert len(dismissed) == 1
+    assert "pam_selinux_check" in dismissed[0]["hint_pattern"]
+
+
+def test_apply_hints_prefilter_keeps_unmatched():
+    hints = scan.PackageHints(
+        facts=[],
+        dismiss_patterns=[re.compile(r"pam_selinux_check", re.IGNORECASE)],
+        raw_dismissals=["pam_selinux_check"],
+    )
+    finding = scan.Finding(
+        severity="High", location="_strbuf_reserve",
+        type="heap-overflow",
+        description="doubling branch overflow",
+        exploitation="", file="pam_env.c", model="test", stage="triage",
+    )
+    kept, dismissed = scan.apply_hints_prefilter([finding], hints)
+    assert len(kept) == 1
+    assert len(dismissed) == 0
+
+
+def test_apply_hints_prefilter_none_hints():
+    finding = scan.Finding(
+        severity="High", location="func",
+        type="overflow", description="x",
+        exploitation="", file="a.c", model="test", stage="triage",
+    )
+    kept, dismissed = scan.apply_hints_prefilter([finding], None)
+    assert len(kept) == 1
+    assert len(dismissed) == 0
+
+
+# ── Regression corpus tests ──────��───────────────────────────────────
+
+
+def test_regression_corpus_loads():
+    """Corpus JSON is valid and has the required fields."""
+    corpus_path = Path(__file__).resolve().parent.parent / "regression" / "corpus.json"
+    with corpus_path.open() as f:
+        corpus = json.load(f)
+    assert len(corpus) >= 10
+    verdicts = set()
+    for case in corpus:
+        assert "id" in case
+        assert "expected_verdict" in case
+        assert "finding" in case
+        assert "snippet" in case or "why_noise" in case or "why_upstream_hardening" in case
+        verdicts.add(case["expected_verdict"])
+    assert "REPORT" in verdicts
+    assert "NOISE" in verdicts
+    assert "REPORT_IF_CONFIGURED" in verdicts
+    assert "NEEDS_REPRODUCER" in verdicts
+    assert "UPSTREAM_HARDENING" in verdicts

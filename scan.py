@@ -306,6 +306,80 @@ def apply_contract_prefilter(
     return kept, dismissed
 
 
+# ── Package hints ──────────────────────────────────────────────────────
+
+HINTS_FILENAME = ".scanner-hints.toml"
+
+
+@dataclass
+class PackageHints:
+    facts: List[str]
+    dismiss_patterns: List[re.Pattern]
+    raw_dismissals: List[str]
+
+
+def load_package_hints(source_dir: str) -> Optional[PackageHints]:
+    hints_path = Path(source_dir) / HINTS_FILENAME
+    if not hints_path.exists():
+        return None
+    with hints_path.open("rb") as f:
+        data = tomllib.load(f)
+    facts = list(data.get("facts", []))
+    raw_dismissals = list(data.get("dismiss", []))
+    patterns = []
+    for pat in raw_dismissals:
+        try:
+            patterns.append(re.compile(pat, re.IGNORECASE))
+        except re.error:
+            pass
+    return PackageHints(facts=facts, dismiss_patterns=patterns,
+                        raw_dismissals=raw_dismissals)
+
+
+def format_hints_prompt(hints: PackageHints) -> str:
+    if not hints or not hints.facts:
+        return ""
+    lines = [
+        "\nPACKAGE-SPECIFIC FACTS (from prior audit, verified ground truth):\n"
+    ]
+    for fact in hints.facts:
+        lines.append(f"  - {fact}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def apply_hints_prefilter(
+    findings: List["Finding"], hints: Optional[PackageHints],
+) -> Tuple[List["Finding"], List[dict]]:
+    if not hints or not hints.dismiss_patterns:
+        return findings, []
+    kept = []
+    dismissed = []
+    for f in findings:
+        desc_lower = (f.description or "").lower()
+        loc_lower = (f.location or "").lower()
+        text = f"{loc_lower} {desc_lower}"
+        matched_pat = None
+        for pat in hints.dismiss_patterns:
+            if pat.search(text):
+                matched_pat = pat.pattern
+                break
+        if matched_pat:
+            dismissed.append({
+                "finding_key": f.key(),
+                "finding": {
+                    "file": f.file, "severity": f.severity,
+                    "location": f.location, "type": f.type,
+                    "description": f.description,
+                },
+                "hint_pattern": matched_pat,
+                "reason": f"Matches package hint dismissal: {matched_pat}",
+            })
+        else:
+            kept.append(f)
+    return kept, dismissed
+
+
 # ── Backend abstraction ─────────────────────────────────────────────────
 
 class Backend:
@@ -2446,7 +2520,7 @@ after a cast.
 
 If while evaluating this finding you notice a SEPARATE real
 vulnerability in the same file, surface it as ADDITIONAL_FINDING.
-{contracts}
+{contracts}{hints}
 Respond in this exact format (no other text):
 
 OUTCOME: CONFIRMED | FALSE_POSITIVE | NEED_CALLERS
@@ -2537,6 +2611,7 @@ def run_confirmation_pass(catchup_findings: List[Finding],
                           source_dir: str,
                           session_dir: Path,
                           contract_packs: Optional[List[ContractPack]] = None,
+                          package_hints: Optional[PackageHints] = None,
                           ) -> Dict[str, dict]:
     """Whole-file confirmation pass (pass 2) for catch-up findings.
 
@@ -2590,6 +2665,7 @@ def run_confirmation_pass(catchup_findings: List[Finding],
             caller_ctx = find_cross_references(
                 finding, source_dir, relpath,
             )
+            hints_text = format_hints_prompt(package_hints) if package_hints else ""
             prompt = CONFIRMATION_PROMPT.format(
                 severity=finding.severity,
                 location=finding.location,
@@ -2597,6 +2673,7 @@ def run_confirmation_pass(catchup_findings: List[Finding],
                 description=finding.description,
                 code=code,
                 contracts=contracts_text,
+                hints=hints_text,
                 caller_context=caller_ctx,
             )
             raw = backend.query("", prompt)
@@ -2980,7 +3057,9 @@ def extract_config_defaults(source_dir: str) -> str:
 
 def run_verdict_stage(consensus: List[dict], backend: Backend,
                       source_dir: str, session_dir: Path,
-                      profile_by_file: dict) -> List[dict]:
+                      profile_by_file: dict,
+                      package_hints: Optional[PackageHints] = None,
+                      ) -> List[dict]:
     """Run verdict stage: verify findings against source code."""
     # Load any confirmation-pass outputs so we can show them to verdict
     confirm_results = load_confirmation_results(session_dir, "triage_confirm")
@@ -3054,6 +3133,9 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
             aux_section += config_defaults_section
         if codec_section:
             aux_section += codec_section
+        hints_section = format_hints_prompt(package_hints) if package_hints else ""
+        if hints_section:
+            aux_section += hints_section
 
         prompt = profile.verdict_prompt_template.format(
             filename=group["findings"][0].file,
@@ -3232,6 +3314,11 @@ def run_pipeline(args) -> ScanResult:
         n_contracts = sum(len(p.contracts) for p in contract_packs)
         print(f"\nContracts: {pack_names} ({n_contracts} entries)", flush=True)
 
+    package_hints = load_package_hints(source_dir)
+    if package_hints:
+        print(f"\nPackage hints: {len(package_hints.facts)} fact(s), "
+              f"{len(package_hints.dismiss_patterns)} dismissal(s)", flush=True)
+
     print(f"\nSession: {session_id}", flush=True)
     print(f"Session dir: {session_dir}", flush=True)
     if resume_session:
@@ -3369,6 +3456,28 @@ def run_pipeline(args) -> ScanResult:
                     print(f"    -> {d['contract_symbol']}: "
                           f"{d['finding']['location']}", flush=True)
 
+        # ── Package hints pre-filter ──
+        if catchup_findings and package_hints:
+            catchup_findings, hints_dismissed = apply_hints_prefilter(
+                catchup_findings, package_hints,
+            )
+            if hints_dismissed:
+                dismiss_dir = session_dir / "hints_dismissed"
+                dismiss_dir.mkdir(exist_ok=True)
+                write_json(dismiss_dir / "dismissed.json", {
+                    "stage": "hints_prefilter",
+                    "created_at": utc_now(),
+                    "dismissed": hints_dismissed,
+                })
+                print(
+                    f"\nHints pre-filter: dismissed {len(hints_dismissed)} "
+                    f"finding(s) by package hints",
+                    flush=True,
+                )
+                for d in hints_dismissed:
+                    print(f"    -> {d['hint_pattern']}: "
+                          f"{d['finding']['location']}", flush=True)
+
         # ── Stage 1c: Confirmation pass (whole-file) ──
         # For each catch-up finding, re-ask with the whole file as context.
         # The model may ask for callers — if so, we run pass 3.
@@ -3383,6 +3492,7 @@ def run_pipeline(args) -> ScanResult:
                 catchup_findings, files, reasoning_backend,
                 source_dir, session_dir,
                 contract_packs=contract_packs,
+                package_hints=package_hints,
             )
             n_need_callers = sum(1 for v in confirmation.values()
                                  if v["outcome"] == "NEED_CALLERS")
@@ -3467,7 +3577,8 @@ def run_pipeline(args) -> ScanResult:
     print(f"{'='*60}", flush=True)
 
     profile_by_file = {str(f.path.relative_to(source_dir)): f.profile for f in files}
-    consensus = run_verdict_stage(consensus, verdict_backend, source_dir, session_dir, profile_by_file)
+    consensus = run_verdict_stage(consensus, verdict_backend, source_dir, session_dir, profile_by_file,
+                                  package_hints=package_hints)
 
     # Filter: keep everything except NOISE
     for group in consensus:

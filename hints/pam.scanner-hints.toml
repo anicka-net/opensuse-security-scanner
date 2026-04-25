@@ -1,0 +1,24 @@
+# Package hints for Linux-PAM 1.7.x
+# Verified facts from the 2026-04-25 audit.
+# Place as .scanner-hints.toml in the PAM source tree root.
+
+facts = [
+    "libpamc.so has zero consumers on openSUSE (ldd scan of /usr/bin, /usr/sbin, /usr/libexec)",
+    "pam_selinux_check is a test/diagnostic utility, not installed setuid",
+    "pwhistory_helper is installed non-setuid under /usr/libexec/pam_pwhistory_helper",
+    "ROOT_USER = 0 and ROOT_GROUP = 0 are hardcoded constants (pam_timestamp.c:96-97)",
+    "DEFAULT_USER_READ_ENVFILE = 0: ~/.pam_environment parsing is opt-in, not default",
+    "D() macro is a no-op without -DDEBUG (production builds do not set -DDEBUG)",
+    "TIMESTAMPDIR resolves to /var/run/pam_timestamp, owned by root:root",
+]
+
+dismiss = [
+    # libpamc findings — library has no consumers
+    "libpamc.*PAM_BP",
+    "PAM_BP.*libpamc",
+    # pam_selinux_check — not installed, test utility
+    "pam_selinux_check",
+    # D() macro format strings — debug-only, unreachable
+    "D\\(.*format.string",
+    "format.string.*D\\(",
+]
