@@ -21,5 +21,10 @@
 # reasoning = "ollama/gemma4:31b"
 # verdict = "claude/opus"
 
+# --- Contracts ---
+# Contract packs inject verified API ground truth into confirmation prompts
+# and pre-filter findings that contradict known contracts.
+# contracts = "auto" # auto-detect from source includes, or "none", or "pam"
+
 # --- Stage Toggles ---
 # triage_only = false

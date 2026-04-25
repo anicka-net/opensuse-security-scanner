@@ -64,6 +64,7 @@ import requests
 
 ROOT_DIR = Path(__file__).resolve().parent
 PROFILES_DIR = ROOT_DIR / "profiles"
+CONTRACTS_DIR = ROOT_DIR / "contracts"
 
 
 # ── Profiles ────────────────────────────────────────────────────────────
@@ -116,6 +117,193 @@ class Profile:
 class SourceFile:
     path: Path
     profile: Profile
+    file_class: str = "production"
+
+
+# ── File classification ───────────────────────────────────────────────
+
+_NONPROD_DIR_PATTERNS = (
+    "examples", "example", "demo", "demos", "sample", "samples",
+    "xtests", "xtest", "benchmarks", "benchmark", "bench",
+    "doc", "docs", "documentation",
+    "contrib",
+)
+
+_NONPROD_FILENAME_PATTERNS = [
+    re.compile(r"^tst[-_]"),
+    re.compile(r"[-_]check\.c$"),
+    re.compile(r"^check[-_]"),
+    re.compile(r"[-_]test\.c$"),
+    re.compile(r"[-_]retval\.c$"),
+    re.compile(r"[-_]example\."),
+    re.compile(r"[-_]demo\."),
+    re.compile(r"^example[-_.]"),
+]
+
+
+def classify_file_path(relpath: str) -> str:
+    parts = [p.lower() for p in Path(relpath).parts]
+    for part in parts[:-1]:
+        if part in _NONPROD_DIR_PATTERNS:
+            if part in ("doc", "docs", "documentation"):
+                return "documentation"
+            if part in ("benchmarks", "benchmark", "bench"):
+                return "benchmark"
+            if part in ("examples", "example", "demo", "demos",
+                        "sample", "samples", "contrib"):
+                return "example"
+            return "test"
+        if part in DEFAULT_SKIP_DIRS:
+            return "test"
+    filename = parts[-1] if parts else ""
+    for pat in _NONPROD_FILENAME_PATTERNS:
+        if pat.search(filename):
+            return "test"
+    return "production"
+
+
+# ── Contracts ──────────────────────────────────────────────────────────
+
+@dataclass
+class ContractEntry:
+    id: str
+    symbol: str
+    kind: str
+    behavior: str
+    source: str
+    dismiss_patterns: List[re.Pattern]
+
+
+@dataclass
+class ContractPack:
+    name: str
+    description: str
+    detect_includes: List[str]
+    contracts: List[ContractEntry]
+
+
+def load_contract_pack(name: str) -> ContractPack:
+    path = CONTRACTS_DIR / f"{name}.json"
+    if not path.exists():
+        available = ", ".join(sorted(p.stem for p in CONTRACTS_DIR.glob("*.json")))
+        raise ValueError(f"Unknown contract pack {name!r}. Available: {available}")
+    payload = load_json(path)
+    entries = []
+    for c in payload.get("contracts", []):
+        patterns = []
+        for pat in c.get("dismiss_if", []):
+            try:
+                patterns.append(re.compile(pat, re.IGNORECASE))
+            except re.error:
+                pass
+        entries.append(ContractEntry(
+            id=c["id"], symbol=c["symbol"], kind=c["kind"],
+            behavior=c["behavior"], source=c.get("source", ""),
+            dismiss_patterns=patterns,
+        ))
+    return ContractPack(
+        name=payload["name"],
+        description=payload.get("description", ""),
+        detect_includes=payload.get("detect", {}).get("includes", []),
+        contracts=entries,
+    )
+
+
+def available_contract_packs() -> List[str]:
+    if not CONTRACTS_DIR.exists():
+        return []
+    return sorted(p.stem for p in CONTRACTS_DIR.glob("*.json"))
+
+
+def detect_contract_packs(files: List[SourceFile]) -> List[ContractPack]:
+    available = available_contract_packs()
+    if not available:
+        return []
+    packs = [load_contract_pack(name) for name in available]
+    sample_lines = set()
+    for sf in files[:200]:
+        try:
+            with open(sf.path, errors="replace") as fh:
+                for i, line in enumerate(fh):
+                    if i >= 100:
+                        break
+                    if "#include" in line:
+                        sample_lines.add(line.strip())
+        except OSError:
+            pass
+    activated = []
+    for pack in packs:
+        for header in pack.detect_includes:
+            if any(header in line for line in sample_lines):
+                activated.append(pack)
+                break
+    return activated
+
+
+def load_contract_packs(spec: str, files: List[SourceFile]) -> List[ContractPack]:
+    if spec == "none":
+        return []
+    if spec == "auto":
+        return detect_contract_packs(files)
+    return [load_contract_pack(name.strip()) for name in spec.split(",") if name.strip()]
+
+
+def contracts_for_code(code: str, packs: List[ContractPack]) -> List[ContractEntry]:
+    relevant = []
+    for pack in packs:
+        for entry in pack.contracts:
+            if entry.symbol in code:
+                relevant.append(entry)
+    return relevant
+
+
+def format_contracts_prompt(entries: List[ContractEntry]) -> str:
+    if not entries:
+        return ""
+    lines = [
+        "\nTRUSTED API CONTRACTS (verified ground truth — do not second-guess these):\n"
+    ]
+    for e in entries:
+        lines.append(f"  - {e.symbol} ({e.kind}): {e.behavior}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def apply_contract_prefilter(
+    findings: List["Finding"], packs: List[ContractPack],
+) -> Tuple[List["Finding"], List[dict]]:
+    if not packs:
+        return findings, []
+    all_entries = [e for p in packs for e in p.contracts]
+    kept = []
+    dismissed = []
+    for f in findings:
+        desc_lower = f.description.lower() if f.description else ""
+        matched = None
+        for entry in all_entries:
+            if entry.symbol.lower() not in desc_lower:
+                continue
+            for pat in entry.dismiss_patterns:
+                if pat.search(desc_lower):
+                    matched = entry
+                    break
+            if matched:
+                break
+        if matched:
+            dismissed.append({
+                "finding_key": f.key(),
+                "finding": {
+                    "file": f.file, "severity": f.severity,
+                    "location": f.location, "type": f.type,
+                    "description": f.description,
+                },
+                "contract_id": matched.id,
+                "contract_symbol": matched.symbol,
+                "reason": f"Contradicts contract: {matched.symbol} — {matched.behavior}",
+            })
+        else:
+            kept.append(f)
+    return kept, dismissed
 
 
 # ── Backend abstraction ─────────────────────────────────────────────────
@@ -419,11 +607,9 @@ def find_source_files(source_dir: str, profiles: List[Profile]) -> List[SourceFi
     for p in Path(source_dir).rglob("*"):
         profile = extension_map.get(p.suffix.lower())
         if profile and p.is_file():
-            # Make the check case-insensitive
-            parts = [part.lower() for part in p.parts]
-            if any(t in parts for t in DEFAULT_SKIP_DIRS):
-                continue
-            files.append(SourceFile(path=p, profile=profile))
+            relpath = str(p.relative_to(source_dir))
+            file_class = classify_file_path(relpath)
+            files.append(SourceFile(path=p, profile=profile, file_class=file_class))
     files.sort(key=lambda item: item.path.stat().st_size, reverse=True)
     return files
 
@@ -2221,6 +2407,17 @@ Now I'm showing you the WHOLE file. Decide which of these applies:
   NEED_CALLERS — you cannot decide without seeing how specific functions
     are called from other files.  Specify which functions.
 
+CALLER-PROOF RULE: If your reasoning says a function parameter is
+"attacker-controlled" or "user-supplied", you MUST cite at least one
+concrete call site (from the cross-file references below, or from
+within this file) where untrusted data actually reaches that parameter.
+If no such call site is visible, use NEED_CALLERS — do NOT assume
+parameters are attacker-controlled just because they could theoretically
+be. Conversely, if cross-file references show callers pass only trusted
+values (constants, root-owned paths, compile-time sizes), that is
+evidence for FALSE_POSITIVE.
+{caller_context}
+
 KEY PROCEDURE — when the finding involves a sink that calls a helper
 (allocator, validator, reserve/resize/grow, length-check), DO NOT just
 refute the finding's wording.  Open the helper's code and check it
@@ -2249,7 +2446,7 @@ after a cast.
 
 If while evaluating this finding you notice a SEPARATE real
 vulnerability in the same file, surface it as ADDITIONAL_FINDING.
-
+{contracts}
 Respond in this exact format (no other text):
 
 OUTCOME: CONFIRMED | FALSE_POSITIVE | NEED_CALLERS
@@ -2338,7 +2535,9 @@ def run_confirmation_pass(catchup_findings: List[Finding],
                           files: List[SourceFile],
                           backend: Backend,
                           source_dir: str,
-                          session_dir: Path) -> Dict[str, dict]:
+                          session_dir: Path,
+                          contract_packs: Optional[List[ContractPack]] = None,
+                          ) -> Dict[str, dict]:
     """Whole-file confirmation pass (pass 2) for catch-up findings.
 
     For each finding from function-level catch-up, re-send the finding
@@ -2377,19 +2576,28 @@ def run_confirmation_pass(catchup_findings: List[Finding],
         if len(code) > 40000:
             code = code[:40000] + "\n\n// ... [file truncated]"
 
+        contract_entries = contracts_for_code(code, contract_packs or [])
+        contracts_text = format_contracts_prompt(contract_entries)
+
         print(
-            f"  [{i+1}/{len(by_file)}] {relpath} ({len(file_findings)} finding(s))",
+            f"  [{i+1}/{len(by_file)}] {relpath} ({len(file_findings)} finding(s))"
+            + (f" [{len(contract_entries)} contract(s)]" if contract_entries else ""),
             flush=True,
         )
 
         evaluations = []
         for finding in file_findings:
+            caller_ctx = find_cross_references(
+                finding, source_dir, relpath,
+            )
             prompt = CONFIRMATION_PROMPT.format(
                 severity=finding.severity,
                 location=finding.location,
                 type=finding.type,
                 description=finding.description,
                 code=code,
+                contracts=contracts_text,
+                caller_context=caller_ctx,
             )
             raw = backend.query("", prompt)
             if not raw or not raw.strip():
@@ -2745,13 +2953,22 @@ def run_verdict_stage(consensus: List[dict], backend: Backend,
         raw = backend.query("", prompt)
         group["verdict_raw"] = raw
 
-        # Parse verdict — match the actual VERDICT: line to avoid
-        # false matches from the word appearing in reasoning text
-        verdict_match = re.search(r"VERDICT:\s*(CONFIRMED|FALSE_POSITIVE|NEEDS_CONTEXT)", raw)
+        # Parse verdict — new actionability labels + backward compat
+        verdict_match = re.search(
+            r"VERDICT:\s*(REPORT_IF_CONFIGURED|REPORT|UPSTREAM_HARDENING|"
+            r"NEEDS_REPRODUCER|NOISE|CONFIRMED|FALSE_POSITIVE|NEEDS_CONTEXT)",
+            raw,
+        )
         if verdict_match:
-            group["verdict"] = verdict_match.group(1)
+            v = verdict_match.group(1)
+            _COMPAT = {
+                "CONFIRMED": "REPORT",
+                "FALSE_POSITIVE": "NOISE",
+                "NEEDS_CONTEXT": "NEEDS_REPRODUCER",
+            }
+            group["verdict"] = _COMPAT.get(v, v)
         else:
-            group["verdict"] = "NEEDS_CONTEXT"
+            group["verdict"] = "NEEDS_REPRODUCER"
         severity_match = re.search(r"REAL_SEVERITY:\s*(Critical|High|Medium|Low|None)", raw)
         group["real_severity"] = severity_match.group(1) if severity_match else None
 
@@ -2861,7 +3078,35 @@ def run_pipeline(args) -> ScanResult:
         print(f"No matching source files found in {source_dir}", flush=True)
         return result
 
+    nonprod_files = [f for f in files if f.file_class != "production"]
+    prod_files = [f for f in files if f.file_class == "production"]
+    if nonprod_files:
+        by_class: Dict[str, int] = {}
+        for f in nonprod_files:
+            by_class[f.file_class] = by_class.get(f.file_class, 0) + 1
+        class_summary = ", ".join(f"{n} {cls}" for cls, n in sorted(by_class.items()))
+        print(f"\nFile classification: {len(prod_files)} production, "
+              f"{len(nonprod_files)} suppressed ({class_summary})", flush=True)
+        suppress_dir = session_dir / "suppressed_files"
+        suppress_dir.mkdir(exist_ok=True)
+        write_json(suppress_dir / "nonprod.json", {
+            "created_at": utc_now(),
+            "files": [
+                {"path": str(f.path.relative_to(source_dir)), "class": f.file_class}
+                for f in nonprod_files
+            ],
+        })
+    files = prod_files
+
     result.files_scanned = len(files)
+
+    contracts_spec = getattr(args, "contracts", "auto")
+    contract_packs = load_contract_packs(contracts_spec, files)
+    if contract_packs:
+        pack_names = ", ".join(p.name for p in contract_packs)
+        n_contracts = sum(len(p.contracts) for p in contract_packs)
+        print(f"\nContracts: {pack_names} ({n_contracts} entries)", flush=True)
+
     print(f"\nSession: {session_id}", flush=True)
     print(f"Session dir: {session_dir}", flush=True)
     if resume_session:
@@ -2977,6 +3222,28 @@ def run_pipeline(args) -> ScanResult:
         else:
             print("\nCatch-up: no additional findings.", flush=True)
 
+        # ── Contract pre-filter ──
+        if catchup_findings and contract_packs:
+            catchup_findings, contract_dismissed = apply_contract_prefilter(
+                catchup_findings, contract_packs,
+            )
+            if contract_dismissed:
+                dismiss_dir = session_dir / "contract_dismissed"
+                dismiss_dir.mkdir(exist_ok=True)
+                write_json(dismiss_dir / "dismissed.json", {
+                    "stage": "contract_prefilter",
+                    "created_at": utc_now(),
+                    "dismissed": contract_dismissed,
+                })
+                print(
+                    f"\nContract pre-filter: dismissed {len(contract_dismissed)} "
+                    f"finding(s) by known API contracts",
+                    flush=True,
+                )
+                for d in contract_dismissed:
+                    print(f"    -> {d['contract_symbol']}: "
+                          f"{d['finding']['location']}", flush=True)
+
         # ── Stage 1c: Confirmation pass (whole-file) ──
         # For each catch-up finding, re-ask with the whole file as context.
         # The model may ask for callers — if so, we run pass 3.
@@ -2990,6 +3257,7 @@ def run_pipeline(args) -> ScanResult:
             confirmation = run_confirmation_pass(
                 catchup_findings, files, reasoning_backend,
                 source_dir, session_dir,
+                contract_packs=contract_packs,
             )
             n_need_callers = sum(1 for v in confirmation.values()
                                  if v["outcome"] == "NEED_CALLERS")
@@ -3076,9 +3344,9 @@ def run_pipeline(args) -> ScanResult:
     profile_by_file = {str(f.path.relative_to(source_dir)): f.profile for f in files}
     consensus = run_verdict_stage(consensus, verdict_backend, source_dir, session_dir, profile_by_file)
 
-    # Filter: keep only confirmed findings
+    # Filter: keep everything except NOISE
     for group in consensus:
-        if group.get("verdict") == "FALSE_POSITIVE":
+        if group.get("verdict") == "NOISE":
             continue
         result.findings.extend(group["findings"])
 
@@ -3094,11 +3362,17 @@ def generate_report(result: ScanResult, output_path: str):
     session_dir = Path(result.session_dir) if result.session_dir else None
 
     # Load verdict data if available
-    verdict_groups: Dict[str, List[dict]] = {"CONFIRMED": [], "FALSE_POSITIVE": [], "NEEDS_CONTEXT": []}
+    verdict_groups: Dict[str, List[dict]] = {}
+    _VERDICT_COMPAT = {
+        "CONFIRMED": "REPORT",
+        "FALSE_POSITIVE": "NOISE",
+        "NEEDS_CONTEXT": "NEEDS_REPRODUCER",
+    }
     if session_dir and (session_dir / "verdict").exists():
         for path in sorted((session_dir / "verdict").rglob("*.json")):
             payload = load_json(path)
-            v = payload.get("verdict", "NEEDS_CONTEXT")
+            v = payload.get("verdict", "NEEDS_REPRODUCER")
+            v = _VERDICT_COMPAT.get(v, v)
             verdict_groups.setdefault(v, []).append(payload)
 
     has_verdicts = any(verdict_groups.values())
@@ -3112,6 +3386,12 @@ def generate_report(result: ScanResult, output_path: str):
     # Stage summary
     if result.stage_stats:
         lines.append("## Scan funnel\n")
+        nonprod_path = session_dir / "suppressed_files" / "nonprod.json" if session_dir else None
+        if nonprod_path and nonprod_path.exists():
+            nonprod_data = load_json(nonprod_path)
+            n_suppressed = len(nonprod_data.get("files", []))
+            if n_suppressed:
+                lines.append(f"- **Files suppressed (non-production)**: {n_suppressed}")
         lines.append(f"- **Files scanned**: {result.files_scanned}")
         for stage in ("triage", "triage_catchup", "triage_confirm",
                   "triage_confirm_callers", "reasoning", "verdict"):
@@ -3128,29 +3408,50 @@ def generate_report(result: ScanResult, output_path: str):
                 f"{stats['files_with_findings']} with findings, "
                 f"{stats['total_findings']} total findings"
             )
+        contract_dismiss_path = session_dir / "contract_dismissed" / "dismissed.json" if session_dir else None
+        if contract_dismiss_path and contract_dismiss_path.exists():
+            dismissed_data = load_json(contract_dismiss_path)
+            n_dismissed = len(dismissed_data.get("dismissed", []))
+            if n_dismissed:
+                lines.append(f"- **Contract pre-filter**: {n_dismissed} dismissed by known API contracts")
         if has_verdicts:
-            lines.append(
-                f"- **Verdict confirmed**: {len(verdict_groups.get('CONFIRMED', []))} | "
-                f"**False positive**: {len(verdict_groups.get('FALSE_POSITIVE', []))} | "
-                f"**Needs context**: {len(verdict_groups.get('NEEDS_CONTEXT', []))}"
-            )
+            counts = {k: len(v) for k, v in verdict_groups.items() if v}
+            parts = []
+            for label in ("REPORT", "REPORT_IF_CONFIGURED", "UPSTREAM_HARDENING",
+                          "NEEDS_REPRODUCER", "NOISE"):
+                if counts.get(label):
+                    parts.append(f"**{label}**: {counts[label]}")
+            if parts:
+                lines.append("- " + " | ".join(parts))
         lines.append("")
 
-    # When verdicts exist, report by verdict status
+    # When verdicts exist, report by actionability
     if has_verdicts:
-        if verdict_groups.get("CONFIRMED"):
-            lines.append("## Confirmed findings\n")
-            for payload in verdict_groups["CONFIRMED"]:
+        _VERDICT_SECTIONS = [
+            ("REPORT", "Actionable findings (REPORT)",
+             "Real vulnerabilities reachable under default configuration."),
+            ("REPORT_IF_CONFIGURED", "Config-gated findings (REPORT_IF_CONFIGURED)",
+             "Real vulnerabilities whose reachability depends on a non-default configuration."),
+            ("UPSTREAM_HARDENING", "Upstream hardening (UPSTREAM_HARDENING)",
+             "Real code bugs that are dormant in practice — worth a hardening patch."),
+            ("NEEDS_REPRODUCER", "Needs reproducer (NEEDS_REPRODUCER)",
+             "Findings that look real but lack a proven exploitation path."),
+        ]
+        for verdict_key, heading, description in _VERDICT_SECTIONS:
+            items = verdict_groups.get(verdict_key, [])
+            if not items:
+                continue
+            if verdict_key == "REPORT":
+                items = dedup_verdict_findings(items)
+            lines.append(f"## {heading}\n")
+            lines.append(f"*{description}*\n")
+            for payload in items:
                 _format_verdict_finding(lines, payload)
 
-        if verdict_groups.get("NEEDS_CONTEXT"):
-            lines.append("## Findings needing additional context\n")
-            for payload in verdict_groups["NEEDS_CONTEXT"]:
-                _format_verdict_finding(lines, payload)
-
-        if verdict_groups.get("FALSE_POSITIVE"):
-            lines.append("## Filtered as false positive\n")
-            for payload in verdict_groups["FALSE_POSITIVE"]:
+        noise = verdict_groups.get("NOISE", [])
+        if noise:
+            lines.append("## Dismissed as noise (NOISE)\n")
+            for payload in noise:
                 finding = payload.get("findings", [{}])[0]
                 lines.append(
                     f"- ~~[{finding.get('severity', '?')}] "
@@ -3206,7 +3507,66 @@ def _format_verdict_finding(lines: list, payload: dict):
     reasoning_match = re.search(r"REASONING:\s*(.+?)(?:\n\n|\Z)", verdict_raw, re.DOTALL)
     if reasoning_match:
         lines.append(f"\n**Verdict reasoning**: {reasoning_match.group(1).strip()[:500]}")
+
+    related = payload.get("related_findings", [])
+    if related:
+        lines.append(f"\n**Same root cause** ({len(related)} additional call site(s)):")
+        for r in related:
+            lines.append(f"- [{r['severity']}] {r['location']}: {r['description']}")
+
     lines.append("")
+
+
+_TYPE_FAMILY = {
+    "heap-overflow": "overflow", "buffer-overflow": "overflow",
+    "stack-overflow": "overflow", "integer-overflow": "overflow",
+    "out-of-bounds-write": "overflow", "out-of-bounds-read": "overflow",
+    "use-after-free": "memory-safety", "double-free": "memory-safety",
+    "command-injection": "injection", "shell-injection": "injection",
+    "code-injection": "injection", "sql-injection": "injection",
+    "path-traversal": "path-traversal", "directory-traversal": "path-traversal",
+}
+
+
+def _type_family(vuln_type: str) -> str:
+    return _TYPE_FAMILY.get(vuln_type.lower().strip(), vuln_type.lower().strip())
+
+
+def _dedup_key(payload: dict) -> str:
+    finding = payload.get("findings", [{}])[0]
+    file_ = payload.get("file", "")
+    type_fam = _type_family(finding.get("type", ""))
+    return f"{file_}::{type_fam}"
+
+
+def dedup_verdict_findings(payloads: List[dict]) -> List[dict]:
+    groups: Dict[str, List[dict]] = {}
+    for p in payloads:
+        key = _dedup_key(p)
+        groups.setdefault(key, []).append(p)
+
+    result = []
+    for key, group in groups.items():
+        if len(group) == 1:
+            result.append(group[0])
+            continue
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        group.sort(key=lambda p: severity_order.get(
+            (p.get("real_severity") or p.get("findings", [{}])[0].get("severity", "info")).lower(), 5
+        ))
+        primary = dict(group[0])
+        related = []
+        for p in group[1:]:
+            f = p.get("findings", [{}])[0]
+            related.append({
+                "location": f.get("location", "?"),
+                "description": f.get("description", "")[:200],
+                "severity": p.get("real_severity") or f.get("severity", "?"),
+            })
+        primary["related_findings"] = related
+        primary["dedup_count"] = len(group)
+        result.append(primary)
+    return result
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────
@@ -3220,6 +3580,7 @@ CONFIG_KEYS = {
     "json",
     "scratch_dir",
     "profile",
+    "contracts",
     "triage",
     "reasoning",
     "verdict",
@@ -3235,6 +3596,7 @@ CONFIG_STRING_KEYS = {
     "json",
     "scratch_dir",
     "profile",
+    "contracts",
     "triage",
     "reasoning",
     "verdict",
@@ -3322,6 +3684,9 @@ Backend spec format: backend/model[@url]
     parser.add_argument("--profile", default="auto",
                         help="Technology profile set: auto or comma-separated names "
                              "(e.g. c_cpp,python,bash)")
+    parser.add_argument("--contracts", default="auto",
+                        help="Contract packs: auto (detect from includes), none, "
+                             "or comma-separated names (e.g. pam)")
 
     # Stage configuration
     parser.add_argument("--triage", default="ollama/gpt-oss-20b",

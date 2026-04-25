@@ -1,0 +1,68 @@
+{
+  "name": "pam",
+  "description": "Linux-PAM API contracts — verified ground truth for PAM internals",
+  "version": 1,
+  "detect": {
+    "includes": [
+      "security/pam_appl.h",
+      "security/pam_modules.h",
+      "security/_pam_macros.h"
+    ]
+  },
+  "contracts": [
+    {
+      "id": "pam_drop_nulls",
+      "symbol": "_pam_drop",
+      "kind": "macro",
+      "behavior": "_pam_drop(X) calls free(X) then sets X = NULL. The caller's pointer is NULLed after free; subsequent use of that variable is a NULL-deref crash (not exploitable UAF). Double-free is also prevented since free(NULL) is a no-op.",
+      "source": "libpam/include/security/_pam_macros.h",
+      "dismiss_if": ["use.after.free.*_pam_drop", "_pam_drop.*use.after.free",
+                      "double.free.*_pam_drop", "_pam_drop.*double.free"]
+    },
+    {
+      "id": "pam_set_item_copies",
+      "symbol": "pam_set_item",
+      "kind": "function",
+      "behavior": "pam_set_item() deep-copies its data argument (strdup for strings, memcpy for structures). The PAM handle holds an independent copy. Freeing or overwriting the original buffer does not create a dangling reference inside the PAM handle.",
+      "source": "libpam/pam_item.c",
+      "dismiss_if": ["use.after.free.*pam_set_item", "pam_set_item.*dangling",
+                      "pam_set_item.*stale"]
+    },
+    {
+      "id": "pam_set_data_copies_key",
+      "symbol": "pam_set_data",
+      "kind": "function",
+      "behavior": "pam_set_data() copies the data_name key string (strdup). Freeing or reusing the caller's key buffer does not corrupt PAM's internal data registry.",
+      "source": "libpam/pam_data.c",
+      "dismiss_if": ["use.after.free.*pam_set_data.*key", "pam_set_data.*key.*dangling"]
+    },
+    {
+      "id": "pam_read_passwords_bounded",
+      "symbol": "pam_read_passwords",
+      "kind": "function",
+      "behavior": "pam_read_passwords() bounds all reads to PAM_MAX_RESP_SIZE (512 bytes). Input from the conversation function is length-checked before copy.",
+      "source": "libpam/pam_misc.c",
+      "dismiss_if": ["unbounded.*pam_read_passwords", "pam_read_passwords.*overflow",
+                      "pam_read_passwords.*buffer"]
+    },
+    {
+      "id": "pam_modutil_write_loops",
+      "symbol": "pam_modutil_write",
+      "kind": "function",
+      "behavior": "pam_modutil_write() loops write() until all bytes are written or an error occurs. It handles partial writes correctly — short-write vulnerabilities do not apply.",
+      "source": "libpam/pam_modutil_ioloop.c",
+      "dismiss_if": ["short.write.*pam_modutil_write", "pam_modutil_write.*partial",
+                      "pam_modutil_write.*incomplete"]
+    },
+    {
+      "id": "debug_macro_noop",
+      "symbol": "D(",
+      "kind": "macro",
+      "behavior": "D() is a debug-only macro that expands to nothing unless compiled with -DDEBUG. In production builds (the default), D() arguments are never evaluated. Format-string bugs, information leaks, or side effects inside D() are not reachable in production.",
+      "source": "libpam/include/security/_pam_macros.h",
+      "dismiss_if": ["format.string.*D\\(", "D\\(.*format.string",
+                      "info.*leak.*D\\(", "D\\(.*info.*leak",
+                      "D\\(.*attacker"]
+    }
+  ]
+}

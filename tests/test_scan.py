@@ -2093,3 +2093,461 @@ def test_triage_only_keeps_forwarded_out_of_clean(tmp_path, monkeypatch):
     )
     # really_clean.c got a CLEAN verdict from triage, so it IS clean.
     assert "really_clean.c" in result.clean_files
+
+
+# ── Contract DB tests ────────────────────────────────────────────────
+
+
+def test_load_contract_pack():
+    pack = scan.load_contract_pack("pam")
+    assert pack.name == "pam"
+    assert len(pack.contracts) >= 6
+    symbols = {c.symbol for c in pack.contracts}
+    assert "_pam_drop" in symbols
+    assert "pam_set_item" in symbols
+    assert "D(" in symbols
+
+
+def test_available_contract_packs():
+    names = scan.available_contract_packs()
+    assert "pam" in names
+
+
+def test_detect_contract_packs_matches_pam_includes(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "mod.c").write_text(
+        '#include <security/pam_modules.h>\nint main() {}\n'
+    )
+    profile = scan.load_profile("c_cpp")
+    files = [scan.SourceFile(src / "mod.c", profile)]
+    packs = scan.detect_contract_packs(files)
+    assert any(p.name == "pam" for p in packs)
+
+
+def test_detect_contract_packs_no_match(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.c").write_text('#include <stdio.h>\nint main() {}\n')
+    profile = scan.load_profile("c_cpp")
+    files = [scan.SourceFile(src / "main.c", profile)]
+    packs = scan.detect_contract_packs(files)
+    assert packs == []
+
+
+def test_contracts_for_code_filters_by_symbol():
+    pack = scan.load_contract_pack("pam")
+    code_with_drop = "void cleanup() { _pam_drop(ptr); }"
+    relevant = scan.contracts_for_code(code_with_drop, [pack])
+    symbols = {c.symbol for c in relevant}
+    assert "_pam_drop" in symbols
+    assert "pam_set_item" not in symbols
+
+
+def test_format_contracts_prompt_nonempty():
+    pack = scan.load_contract_pack("pam")
+    entries = [c for c in pack.contracts if c.symbol == "_pam_drop"]
+    text = scan.format_contracts_prompt(entries)
+    assert "TRUSTED API CONTRACTS" in text
+    assert "_pam_drop" in text
+    assert "NULL" in text
+
+
+def test_format_contracts_prompt_empty():
+    assert scan.format_contracts_prompt([]) == ""
+
+
+def test_apply_contract_prefilter_dismisses_matching():
+    pack = scan.load_contract_pack("pam")
+    finding = scan.Finding(
+        severity="High", location="_unix_getpwnam",
+        type="use-after-free",
+        description="use-after-free: pointer freed via _pam_drop is later dereferenced",
+        exploitation="", file="pam_unix.c", model="test", stage="triage",
+    )
+    kept, dismissed = scan.apply_contract_prefilter([finding], [pack])
+    assert len(kept) == 0
+    assert len(dismissed) == 1
+    assert dismissed[0]["contract_symbol"] == "_pam_drop"
+
+
+def test_apply_contract_prefilter_keeps_unrelated():
+    pack = scan.load_contract_pack("pam")
+    finding = scan.Finding(
+        severity="High", location="_strbuf_reserve",
+        type="heap-overflow",
+        description="doubling branch does not account for existing length",
+        exploitation="", file="pam_env.c", model="test", stage="triage",
+    )
+    kept, dismissed = scan.apply_contract_prefilter([finding], [pack])
+    assert len(kept) == 1
+    assert len(dismissed) == 0
+
+
+def test_apply_contract_prefilter_requires_both_symbol_and_pattern():
+    pack = scan.load_contract_pack("pam")
+    finding = scan.Finding(
+        severity="High", location="check_auth",
+        type="use-after-free",
+        description="use-after-free in authentication handler",
+        exploitation="", file="pam_unix.c", model="test", stage="triage",
+    )
+    kept, dismissed = scan.apply_contract_prefilter([finding], [pack])
+    assert len(kept) == 1
+    assert len(dismissed) == 0
+
+
+def test_apply_contract_prefilter_debug_macro():
+    pack = scan.load_contract_pack("pam")
+    finding = scan.Finding(
+        severity="Medium", location="do_auth",
+        type="format-string",
+        description="format string vulnerability in D() debug macro — attacker input reaches printf",
+        exploitation="", file="pam_unix.c", model="test", stage="triage",
+    )
+    kept, dismissed = scan.apply_contract_prefilter([finding], [pack])
+    assert len(kept) == 0
+    assert len(dismissed) == 1
+    assert dismissed[0]["contract_symbol"] == "D("
+
+
+def test_load_contract_packs_none():
+    packs = scan.load_contract_packs("none", [])
+    assert packs == []
+
+
+def test_load_contract_packs_explicit():
+    packs = scan.load_contract_packs("pam", [])
+    assert len(packs) == 1
+    assert packs[0].name == "pam"
+
+
+def test_confirmation_prompt_includes_contracts(tmp_path):
+    """Confirmation prompt gets contract text injected when contracts apply."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "pam_test.c").write_text(
+        '#include <security/pam_modules.h>\n'
+        'void cleanup() { _pam_drop(ptr); }\n'
+    )
+    session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "pkg")
+
+    finding = scan.Finding(
+        severity="High", location="cleanup()",
+        type="use-after-free", description="ptr used after _pam_drop",
+        exploitation="", file="pam_test.c", model="test", stage="triage",
+    )
+
+    prompts_seen = []
+
+    class CaptureBackend(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            prompts_seen.append(user)
+            return "OUTCOME: FALSE_POSITIVE\nREASONING: _pam_drop NULLs the pointer"
+        def __repr__(self):
+            return "test/capture"
+
+    source_file = scan.SourceFile(source_dir / "pam_test.c", scan.load_profile("c_cpp"))
+    packs = scan.load_contract_packs("pam", [])
+
+    scan.run_confirmation_pass(
+        [finding], [source_file], CaptureBackend(),
+        str(source_dir), session_dir,
+        contract_packs=packs,
+    )
+
+    assert prompts_seen
+    prompt_text = prompts_seen[0]
+    assert "TRUSTED API CONTRACTS" in prompt_text
+    assert "_pam_drop" in prompt_text
+
+
+# ── File classification tests ────────────────────────────────────────
+
+
+def test_classify_file_path_production():
+    assert scan.classify_file_path("modules/pam_unix/pam_unix_auth.c") == "production"
+    assert scan.classify_file_path("libpam/pam_handlers.c") == "production"
+    assert scan.classify_file_path("src/main.c") == "production"
+
+
+def test_classify_file_path_examples():
+    assert scan.classify_file_path("examples/xsh.c") == "example"
+    assert scan.classify_file_path("example/demo.c") == "example"
+    assert scan.classify_file_path("demos/show.py") == "example"
+    assert scan.classify_file_path("contrib/helper.c") == "example"
+
+
+def test_classify_file_path_tests_by_dir():
+    assert scan.classify_file_path("xtests/tst-pam_dispatch.c") == "test"
+    assert scan.classify_file_path("tests/check_auth.c") == "test"
+    assert scan.classify_file_path("test/run.c") == "test"
+
+
+def test_classify_file_path_tests_by_filename():
+    assert scan.classify_file_path("modules/pam_selinux/pam_selinux_check.c") == "test"
+    assert scan.classify_file_path("src/tst-overflow.c") == "test"
+    assert scan.classify_file_path("src/check_password.c") == "test"
+    assert scan.classify_file_path("lib/auth-retval.c") == "test"
+
+
+def test_classify_file_path_benchmarks():
+    assert scan.classify_file_path("benchmarks/perf.c") == "benchmark"
+    assert scan.classify_file_path("bench/speed.c") == "benchmark"
+
+
+def test_classify_file_path_documentation():
+    assert scan.classify_file_path("doc/example.c") == "documentation"
+    assert scan.classify_file_path("docs/sample.py") == "documentation"
+
+
+def test_find_source_files_classifies(tmp_path):
+    """find_source_files sets file_class on each file."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "main.c").write_text("int main() {}\n")
+    examples = src / "examples"
+    examples.mkdir()
+    (examples / "demo.c").write_text("int demo() {}\n")
+    xtests = src / "xtests"
+    xtests.mkdir()
+    (xtests / "tst-check.c").write_text("int test() {}\n")
+
+    files = scan.find_source_files(str(src), scan.load_profiles("c_cpp"))
+    by_name = {f.path.name: f for f in files}
+
+    assert by_name["main.c"].file_class == "production"
+    assert by_name["demo.c"].file_class == "example"
+    assert by_name["tst-check.c"].file_class == "test"
+
+
+def test_pipeline_suppresses_nonprod_files(tmp_path, monkeypatch):
+    """Non-production files are excluded from scanning."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "main.c").write_text("int main() { return 0; }\n")
+    examples = source_dir / "examples"
+    examples.mkdir()
+    (examples / "demo.c").write_text("int demo() { return 0; }\n")
+
+    scanned_files = []
+
+    class TrackingBackend(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            label = user.splitlines()[0].removeprefix("SOURCE FILE: ")
+            filename = label.split(" (part ", 1)[0].split("::", 1)[0]
+            scanned_files.append(filename)
+            return "CLEAN"
+        def __repr__(self):
+            return "test/tracking"
+
+    monkeypatch.setattr(scan, "parse_backend_spec", lambda spec: TrackingBackend())
+
+    args = Namespace(
+        source_dir=str(source_dir),
+        obs_package=None,
+        package_name="pkg",
+        output=str(tmp_path / "report.md"),
+        json=None,
+        scratch_dir=str(tmp_path / "scratch"),
+        profile="c_cpp",
+        triage="test/tracking",
+        reasoning="test/tracking",
+        verdict=None,
+        triage_only=False,
+    )
+    result = scan.run_pipeline(args)
+
+    assert any("main.c" in f for f in scanned_files)
+    assert not any("demo.c" in f for f in scanned_files)
+
+    suppress_path = Path(result.session_dir) / "suppressed_files" / "nonprod.json"
+    assert suppress_path.exists()
+    suppressed = scan.load_json(suppress_path)
+    suppressed_paths = [f["path"] for f in suppressed["files"]]
+    assert any("demo.c" in p for p in suppressed_paths)
+
+
+# ── Caller-proof rule tests ──────────────────────────────────────────
+
+
+def test_confirmation_prompt_has_caller_proof_rule(tmp_path):
+    """Confirmation prompt includes caller-proof rule and cross-references."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "lib.c").write_text(
+        "void vuln_func(char *input) { strcpy(buf, input); }\n"
+    )
+    (source_dir / "caller.c").write_text(
+        '#include "lib.h"\n'
+        'int main() { vuln_func(argv[1]); }\n'
+    )
+    session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "pkg")
+
+    finding = scan.Finding(
+        severity="High", location="vuln_func",
+        type="buffer-overflow",
+        description="strcpy with unbounded input",
+        exploitation="", file="lib.c",
+        model="test", stage="triage",
+    )
+
+    prompts_seen = []
+
+    class CaptureBackend(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            prompts_seen.append(user)
+            return "OUTCOME: CONFIRMED\nREASONING: caller passes argv"
+        def __repr__(self):
+            return "test/capture"
+
+    source_file = scan.SourceFile(source_dir / "lib.c", scan.load_profile("c_cpp"))
+    scan.run_confirmation_pass(
+        [finding], [source_file], CaptureBackend(),
+        str(source_dir), session_dir,
+    )
+
+    assert prompts_seen
+    prompt_text = prompts_seen[0]
+    assert "CALLER-PROOF RULE" in prompt_text
+    assert "caller.c" in prompt_text
+    assert "vuln_func" in prompt_text
+
+
+def test_confirmation_prompt_caller_proof_no_callers(tmp_path):
+    """When no cross-file callers exist, caller_context is empty."""
+    source_dir = tmp_path / "src"
+    source_dir.mkdir()
+    (source_dir / "standalone.c").write_text(
+        "static void internal(int x) { return; }\n"
+    )
+    session_id, session_dir = scan.make_session_dir(str(tmp_path / "s"), "pkg")
+
+    finding = scan.Finding(
+        severity="High", location="internal",
+        type="integer-overflow",
+        description="x can overflow",
+        exploitation="", file="standalone.c",
+        model="test", stage="triage",
+    )
+
+    prompts_seen = []
+
+    class CaptureBackend(scan.Backend):
+        def query(self, system, user, max_tokens=16384):
+            prompts_seen.append(user)
+            return "OUTCOME: NEED_CALLERS\nREASONING: no visible callers\nCALLERS_OF: internal"
+        def __repr__(self):
+            return "test/capture"
+
+    source_file = scan.SourceFile(source_dir / "standalone.c", scan.load_profile("c_cpp"))
+    scan.run_confirmation_pass(
+        [finding], [source_file], CaptureBackend(),
+        str(source_dir), session_dir,
+    )
+
+    assert prompts_seen
+    prompt_text = prompts_seen[0]
+    assert "CALLER-PROOF RULE" in prompt_text
+    assert "CROSS-FILE REFERENCES" not in prompt_text
+
+
+# ── Auto-dedup tests ────────────────────────────────────────────────
+
+
+def _make_verdict_payload(file, location, vuln_type, severity="High"):
+    return {
+        "file": file,
+        "verdict": "CONFIRMED",
+        "real_severity": severity,
+        "verdict_raw": "VERDICT: CONFIRMED\nREASONING: test",
+        "stages": ["triage", "reasoning"],
+        "findings": [{
+            "severity": severity,
+            "location": location,
+            "type": vuln_type,
+            "description": f"vuln in {location}",
+        }],
+    }
+
+
+def test_dedup_clusters_same_file_and_type():
+    """Multiple findings with same file+type cluster into one."""
+    payloads = [
+        _make_verdict_payload("pam_env.c", "_strbuf_reserve", "heap-overflow", "Critical"),
+        _make_verdict_payload("pam_env.c", "_strbuf_add", "heap-overflow", "Critical"),
+        _make_verdict_payload("pam_env.c", "_strbuf_add_string", "heap-overflow", "High"),
+    ]
+    result = scan.dedup_verdict_findings(payloads)
+    assert len(result) == 1
+    assert result[0]["dedup_count"] == 3
+    assert len(result[0]["related_findings"]) == 2
+
+
+def test_dedup_clusters_type_families():
+    """buffer-overflow and heap-overflow are the same family."""
+    payloads = [
+        _make_verdict_payload("lib.c", "func_a", "heap-overflow"),
+        _make_verdict_payload("lib.c", "func_b", "buffer-overflow"),
+    ]
+    result = scan.dedup_verdict_findings(payloads)
+    assert len(result) == 1
+    assert result[0]["dedup_count"] == 2
+
+
+def test_dedup_keeps_different_files_separate():
+    """Same type in different files stays separate."""
+    payloads = [
+        _make_verdict_payload("a.c", "func_a", "heap-overflow"),
+        _make_verdict_payload("b.c", "func_b", "heap-overflow"),
+    ]
+    result = scan.dedup_verdict_findings(payloads)
+    assert len(result) == 2
+
+
+def test_dedup_keeps_different_types_separate():
+    """Different type families in same file stay separate."""
+    payloads = [
+        _make_verdict_payload("lib.c", "func_a", "heap-overflow"),
+        _make_verdict_payload("lib.c", "func_b", "format-string"),
+    ]
+    result = scan.dedup_verdict_findings(payloads)
+    assert len(result) == 2
+
+
+def test_dedup_passthrough_single():
+    """Single findings pass through unchanged."""
+    payloads = [_make_verdict_payload("lib.c", "func_a", "heap-overflow")]
+    result = scan.dedup_verdict_findings(payloads)
+    assert len(result) == 1
+    assert "related_findings" not in result[0]
+    assert "dedup_count" not in result[0]
+
+
+def test_dedup_preserves_highest_severity():
+    """Primary entry is the one with highest severity."""
+    payloads = [
+        _make_verdict_payload("lib.c", "func_low", "heap-overflow", "High"),
+        _make_verdict_payload("lib.c", "func_high", "buffer-overflow", "Critical"),
+    ]
+    result = scan.dedup_verdict_findings(payloads)
+    assert len(result) == 1
+    primary_finding = result[0]["findings"][0]
+    assert primary_finding["location"] == "func_high"
+    assert result[0]["related_findings"][0]["location"] == "func_low"
+
+
+# ── Actionability label tests ────────────────────────────────────────
+
+
+def test_verdict_prompt_has_actionability_labels():
+    """All profile verdict prompts use the new label set."""
+    for name in scan.available_profile_names():
+        profile = scan.load_profile(name)
+        vpt = profile.verdict_prompt_template
+        assert "REPORT|REPORT_IF_CONFIGURED|UPSTREAM_HARDENING|NEEDS_REPRODUCER|NOISE" in vpt, (
+            f"Profile {name} missing new verdict labels"
+        )
+        assert "CONFIRMED|FALSE_POSITIVE|NEEDS_CONTEXT" not in vpt, (
+            f"Profile {name} still has old verdict labels"
+        )
