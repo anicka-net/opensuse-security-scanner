@@ -9,7 +9,7 @@ Three-stage pipeline with pluggable backends at each stage:
   verdict     → Verifies exploitability, eliminates FPs (default: Claude via CLI)
 
 Every stage can use any backend: ollama, openai-compatible (llama.cpp, vLLM),
-claude, gemini, or codex. Configure via CLI flags or config file.
+nvidia nim, claude, gemini, or codex. Configure via CLI flags or config file.
 
 Usage:
   # Defaults (ollama triage + reasoning, no verdict)
@@ -23,6 +23,11 @@ Usage:
     --triage ollama/gpt-oss-20b \\
     --reasoning ollama/kimi-k2 \\
     --verdict ollama/kimi-k2
+
+  # NVIDIA NIM API (set NVIDIA_API_KEY env var)
+  scan.py --source-dir /path/to/src \\
+    --triage nim/google/gemma-4-31b-it \\
+    --verdict nim/google/gemma-4-31b-it
 
   # Frontier models everywhere (token-burning mode)
   scan.py --source-dir /path/to/src \\
@@ -440,6 +445,45 @@ class OpenAIBackend(Backend):
         return f"openai/{self.model}@{self.base_url}"
 
 
+class NIMBackend(Backend):
+    """NVIDIA NIM API backend (integrate.api.nvidia.com)."""
+
+    NIM_BASE = "https://integrate.api.nvidia.com"
+
+    def __init__(self, model: str, base_url: str = ""):
+        self.model = model
+        self.base_url = (base_url or self.NIM_BASE).rstrip("/")
+        self.api_key = os.environ.get("NVIDIA_API_KEY", "")
+
+    def query(self, system: str, user: str, max_tokens: int = 16384) -> str:
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": user})
+        try:
+            resp = requests.post(
+                f"{self.base_url}/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "max_tokens": max_tokens,
+                },
+                timeout=600,
+            )
+            if resp.status_code == 500:
+                return "[ERROR: context exceeded]"
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            return f"[ERROR: nim: {e}]"
+
+    def __repr__(self):
+        return f"nim/{self.model}"
+
+
 class ClaudeBackend(Backend):
     """Claude via CLI (uses subscription, no API key needed).
 
@@ -613,6 +657,7 @@ def parse_backend_spec(spec: str) -> Backend:
       ollama/model-name                  → OllamaBackend
       ollama/model-name@http://host:port → OllamaBackend with custom URL
       openai/model@http://host:port      → OpenAIBackend (llama.cpp, vLLM)
+      nim/google/gemma-4-31b-it          → NIMBackend (NVIDIA API)
       claude/opus                        → ClaudeBackend
       claude/sonnet                      → ClaudeBackend
       gemini/flash                       → GeminiBackend
@@ -635,6 +680,8 @@ def parse_backend_spec(spec: str) -> Backend:
         return OllamaBackend(model, url or "http://localhost:11434")
     elif backend_type == "openai":
         return OpenAIBackend(model, url or "http://localhost:8080")
+    elif backend_type == "nim":
+        return NIMBackend(model, url or "")
     elif backend_type == "claude":
         return ClaudeBackend(model)
     elif backend_type == "gemini":
@@ -643,7 +690,7 @@ def parse_backend_spec(spec: str) -> Backend:
         return CodexBackend(model)
     else:
         raise ValueError(f"Unknown backend: {backend_type!r}. "
-                         f"Use: ollama, openai, claude, gemini, codex")
+                         f"Use: ollama, openai, nim, claude, gemini, codex")
 
 
 # ── File handling ───────────────────────────────────────────────────────
