@@ -1589,8 +1589,13 @@ def _resolve_python_imports(code: str, source_dir: str, filepath: Path) -> str:
 
         # Convert module path to file path
         mod_path = mod.replace(".", "/")
-        candidates = list(Path(source_dir).rglob(f"{mod_path}.py"))
-        candidates.extend(Path(source_dir).rglob(f"{mod_path}/__init__.py"))
+        if mod_path.startswith("/"):
+            continue
+        try:
+            candidates = list(Path(source_dir).rglob(f"{mod_path}.py"))
+            candidates.extend(Path(source_dir).rglob(f"{mod_path}/__init__.py"))
+        except (NotImplementedError, ValueError):
+            continue
 
         for candidate in candidates:
             if candidate.is_file():

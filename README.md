@@ -116,6 +116,7 @@ Every stage accepts a backend spec in `backend/model[@url]` format:
 |---------|--------|------|-------|
 | ollama | `ollama/model-name` | None | Default port 11434. Custom: `ollama/model@http://host:port` |
 | openai | `openai/model@http://host:port` | Optional `OPENAI_API_KEY` | Works with llama.cpp, vLLM, any OpenAI-compatible server |
+| nim | `nim/vendor/model` | `NVIDIA_API_KEY` | NVIDIA NIM cloud API. No GPU needed |
 | claude | `claude/opus`, `claude/sonnet`, `claude/haiku` | CLI subscription | Uses `claude` CLI, no API key needed |
 | gemini | `gemini/flash`, `gemini/pro` | CLI subscription | Uses `gemini` CLI, no API key needed |
 | codex | `codex/default` | CLI subscription | Uses `codex` CLI, no API key needed |
@@ -131,6 +132,11 @@ Every stage accepts a backend spec in `backend/model[@url]` format:
 
 # All local (two GPUs)
 --triage ollama/gpt-oss-20b --reasoning ollama/gemma4:31b
+
+# NVIDIA NIM — three-tier split, no GPU needed
+--triage nim/nvidia/nemotron-3-nano-30b-a3b \
+--reasoning nim/nvidia/llama-3.3-nemotron-super-49b-v1.5 \
+--verdict nim/mistralai/mistral-large-3-675b-instruct-2512
 
 # Mixed local + API
 --triage ollama/gpt-oss-20b --reasoning gemini/flash --verdict claude/opus
