@@ -1,0 +1,32 @@
+# Package hints for account-utils 1.1.0+
+# Verified facts from 2026-04-30 source audit.
+
+facts = [
+    "sd_json_dispatch_string (non-const variant) strdup's data — returned structs own independent copies, no UAF against JSON variant lifetime",
+    "update_passwd/update_shadow in files.c use fstat(fileno(fd)), not stat(path) — TOCTOU-safe pattern",
+    "File locking via lckpwdf() before any /etc/passwd or /etc/shadow operations",
+    "alloc_getxxnam_buffer uses sysconf(_SC_GETPW_R_SIZE_MAX) directly into malloc — no arithmetic overflow possible",
+    "newidmapd verify_range() int64_t overflow is guarded: inputs validated to [0, UID_MAX] before reaching arithmetic",
+    "newuidmap/newgidmap are NOT setuid — privilege mediated via newidmapd daemon over varlink socket",
+    "chage strtol parsing checks errno==ERANGE and l<-1 for all four fields (mindays, maxdays, warndays, inactive)",
+    "crypt_r() returns NULL on invalid salt or OOM — all callers must check return value before strdup/strcmp",
+    "is_shadow/is_blank_password use isempty/strempty null-safe helpers + assert(pw) guards",
+    "sd_varlink_set_userdata(&resp) stores pointer to stack-local — safe because varlink loop is synchronous within same frame",
+]
+
+dismiss = [
+    # fstat-on-fd misread as TOCTOU
+    "TOCTOU.*update_passwd",
+    "TOCTOU.*update_shadow",
+    "stat.*open.*race.*passwd",
+    # sd_json_dispatch_string deep-copies
+    "use.after.free.*varlink.*json",
+    "use.after.free.*pwaccess_get_user_record",
+    # alloc_getxxnam_buffer is safe
+    "integer.overflow.*alloc_getxxnam",
+    "heap.*overflow.*alloc_getxxnam",
+    # verify_range input validation prevents overflow
+    "integer.overflow.*verify_range.*newidmapd",
+    # chage strtol is properly validated
+    "integer.overflow.*strtol.*chage",
+]
