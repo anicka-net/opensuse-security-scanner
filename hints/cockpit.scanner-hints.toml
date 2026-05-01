@@ -1,0 +1,60 @@
+# Package hints for cockpit 360
+# Verified from 2026-05-01 source audit (4 parallel agents + manual review).
+
+facts = [
+    "cockpit is a system administration web UI — filesystem read/write, D-Bus calls, SSH connections are INTENTIONAL features, not vulnerabilities",
+    "All cockpit channels (filesystem, dbus, stream, http) require full PAM authentication — cockpit-bridge only runs post-auth",
+    "cockpit-bridge runs as the authenticated user's UID — OS DAC enforces file access, not cockpit itself",
+    "Superuser mode uses polkit/sudo escalation — only available to admin-group users",
+    "ferny/session.py uses asyncio.create_subprocess_exec (execvp, no shell) with -- separator for SSH destination — no command injection possible",
+    "cockpit/peer.py self.args comes from installed package manifest files (manifest.json), not user input",
+    "containers/ws/release.sh and install.sh are CI/build scripts, not runtime attack surface",
+    "cockpit/channels/dbus.py uses D-Bus IPC calls, not shell commands — match string construction is D-Bus-level, not OS command injection",
+    "cockpitjsonprint.c fprintf calls use key as %s argument, not as format string — format strings are always literals",
+    "src/tls/wsinstance-start.c recv_alnum/recv_all properly bounds reads to sizeof(buffer), returns -1 on overflow",
+    "src/ws/cockpitwebresponse.c web_response_file has multi-layer traversal prevention: blocks /. and ../ and //, uses realpath, asserts path prefix",
+    "src/tls/cockpit-certificate-ensure.c write_file only called with hardcoded literals '0.crt' and '0.key'",
+    "files.js, build.js, cockpit-po-plugin.js, esbuild-test-html-plugin.js are build-time tools, not runtime",
+    "ferny/interaction_client.py uses repr()+ast.literal_eval() (safe), not pickle",
+    "ferny/interaction_agent.py write_askpass_to_tmpdir uses O_CREAT|O_EXCL|O_NOFOLLOW in mode-0700 tmpdir — TOCTOU-safe",
+    "pkg/users/ssh-add-public-key.sh chown $1 — usernames from /etc/passwd are POSIX-restricted, no shell metacharacters",
+    "cockpitauth.c cockpit_ws_ssh_program ends with -- so host from URL is always positional arg, no SSH option injection",
+    "cockpitauth.c session_start_process uses g_spawn_async_with_pipes (no shell), host is plain argv element",
+    "REAL BUG: cockpit_Machines.Update (internal_endpoints.py:84) has path traversal — filename param unsanitized in Path.joinpath()",
+]
+
+dismiss = [
+    # Build-time tools, not runtime
+    ".*files\\.js.*path.traversal",
+    ".*build\\.js.*path.traversal",
+    ".*cockpit-po-plugin.*traversal",
+    ".*esbuild-test-html.*traversal",
+    # Test files
+    ".*test-websocket\\.c.*null",
+    ".*test-server\\.c.*null",
+    ".*test-dbus\\.js.*prototype",
+    ".*test-machines\\.js.*traversal",
+    # Intentional cockpit features
+    ".*filesystem\\.py.*path.*traversal",
+    ".*filesystem\\.py.*arbitrary.*file",
+    "SSRF.*cockpit\\.js.*HttpClient",
+    "SSRF.*plot\\.js.*host",
+    # ferny SSH — no shell involved
+    "command.injection.*ferny.*session",
+    "command.injection.*peer\\.py",
+    # CI/container scripts
+    "command.injection.*release\\.sh",
+    "command.injection.*install\\.sh",
+    # Safe code patterns
+    "format.string.*cockpitjsonprint",
+    "buffer.overflow.*recv_alnum",
+    "buffer.overflow.*wsinstance",
+    "buffer.overflow.*socket-activation",
+    # D-Bus channel is not command injection
+    "command.injection.*dbus\\.py",
+    # Safe deserialization
+    "deserialization.*interaction_client",
+    "deserialization.*interaction_agent",
+    # Prototype pollution via D-Bus proxy — types are validated
+    "prototype.pollution.*interfaces\\.js",
+]
