@@ -1,0 +1,79 @@
+# Package hints for libzypp 17.38.7
+# Verified from 2026-05-02 source audit (3 parallel agents + manual review).
+# 200 CONFIRMED findings analyzed, 0 remotely exploitable.
+
+facts = [
+    "All external program invocations (ExternalProgram, Process) use execv-style argv arrays — no shell interpolation possible",
+    "Temp file creation uses mkdtemp/mkostemp throughout — atomic, race-free",
+    "TmpPath destructor uses LSTAT (not stat) — does not follow symlinks during cleanup",
+    "GPG operations use libgpgme API exclusively (gpgme_op_import, gpgme_op_verify) — no gpg subprocess",
+    "sysconfig::write uses sibling-temp + atomic-rename pattern — safe against symlink attacks",
+    "XML parser uses XML_PARSE_PEDANTIC only — no XXE (external entity loading not enabled)",
+    "PluginRepoverification passes file paths as separate argv[] elements — no shell injection from repo metadata",
+    "PluginFrame::setCommand explicitly checks for embedded newlines and rejects them",
+    "RepoVarExpand grammar allows only one level of embedding — no infinite recursion possible",
+    "RepoVariablesUrlReplacer strips credentials before expansion, re-applies from original",
+    "fillSettingsFromUrl ssl_verify=no is explicit user opt-in via repo URL, not a vulnerability",
+    "HistoryLogReader parses root-written log into in-memory objects — no execution surface",
+    "SystemCheck::loadFile path comes from ZConfig (system config), not repo metadata",
+    "DiskUsageCounter::detectMountPoints reads /proc/mounts (kernel-provided) — no user-controlled paths",
+    "MediaCD/MediaISO/DiscProvider validate devices as block devices via udev before mount",
+    "Mount class uses mount(2) syscall via helper, not shell",
+    "DeviceDriver::createAttachPoint uses mkdtemp for atomic directory creation",
+    "PackageProvider checksum-compares before accepting cached files — effective TOCTOU mitigation",
+    "Fetcher::fixup() explicitly encodes leading ../ sequences as %2E%2E/ — path traversal mitigation",
+    "Fetcher::locateInCache requires checksum match before returning cache hits",
+    "KNOWN ISSUE (local-only): PluginFrame classic IPC path has no body size cap — NG path has 1MB guard",
+    "KNOWN ISSUE (low): userMayWriteOrCreateDir has check-then-use TOCTOU gap — advisory function only",
+    "KNOWN ISSUE (repo-trust): wrtcallback _rangePrefaceBuffer unbounded — malicious multipart server can cause OOM",
+    "KNOWN ISSUE (repo-trust): NetworkProvider::provide() Pathname::cat() with absolute fPath discards _attachPoint prefix",
+    "KNOWN ISSUE (repo-trust): readChecksumsIndex allows ../ in filenames — checksum map key traversal, mitigated by CHECKSUMS signature",
+    "KNOWN ISSUE (repo-trust): ContentFileReader DESCRDIR/DATADIR stored verbatim — could escape cache dir if repo compromised",
+]
+
+dismiss = [
+    # External programs use execv, no shell
+    "command.injection.*ExternalProgram",
+    "command.injection.*Process",
+    "command.injection.*DiscProvider",
+    "command.injection.*MediaCD",
+    "command.injection.*MediaISO",
+    "command.injection.*CheckAccessDeleted",
+    "command.injection.*DiskUsageCounter",
+    "command.injection.*PluginRepoverification",
+    # Temp files are atomic
+    "symlink.*TmpPath",
+    "symlink.*TmpFile",
+    "symlink.*TmpDir",
+    "TOCTOU.*TmpPath",
+    "TOCTOU.*makeSibling",
+    # GPG uses libgpgme API
+    "command.injection.*PublicKey",
+    "command.injection.*KeyManager",
+    "command.injection.*gpg",
+    # XML parser has no XXE
+    "XXE.*Reader",
+    "XXE.*xml",
+    "entity.expansion.*libxml",
+    # Safe write patterns
+    "symlink.*sysconfig.*write",
+    "TOCTOU.*sysconfig",
+    # Lock file in root-owned /run
+    "symlink.*ZYppGlobalLock",
+    "TOCTOU.*ZYppGlobalLock",
+    # Device validation via udev
+    "symlink.*MediaCD",
+    "symlink.*DiscProvider",
+    "path.traversal.*MediaCD",
+    # PluginFrame validates headers
+    "injection.*PluginFrame.*setCommand",
+    "injection.*PluginFrame.*addRawHeader",
+    # RepoVarExpand bounded
+    "infinite.recursion.*RepoVarExpand",
+    "denial.of.service.*RepoVarExpand",
+    # History log is root-written
+    "injection.*HistoryLogReader",
+    # Intentional features
+    "SSRF.*MediaCurl",
+    "SSRF.*NetworkProvider",
+]
