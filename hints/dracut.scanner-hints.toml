@@ -1,0 +1,76 @@
+# Package hints for dracut 110
+# Verified from 2026-05-07 source audit (3 parallel agents + manual review).
+# 191 findings analyzed across 352 files, 0 remotely exploitable.
+
+facts = [
+    "dracut modules.d/ scripts run inside initramfs during boot — single-user environment, no login services, no multi-user /tmp",
+    "initramfs /tmp is a private tmpfs mounted by init — no other users can create symlinks or race conditions",
+    "Primary external input is kernel command line (getarg/getargs) — requires physical access or bootloader compromise to control",
+    "DHCP responses are the only network-sourced input; handled via dhclient variables, not /tmp file manipulation",
+    "Hook scripts (source_hook) are baked into initramfs at build time — not writable at boot time",
+    "Build-time env vars ($SYSTEMCTL, $DRACUT_INSTALL) are root-controlled and intentionally unquoted for multi-word commands",
+    "shutdown.sh case statement whitelists $ACTION to reboot/poweroff/halt/kexec — no arbitrary command execution",
+    "initqueue.sh strips directory components from $job via ${job##*/} — path traversal prevented",
+    "fips-boot.sh validates boot= parameter against allowlist (LABEL=, UUID=, PARTUUID=, PARTLABEL=, /dev/*)",
+    "parse-vlan.sh properly quotes all variables in echo output and filenames",
+    "mdraid_start.sh properly quotes $_uuid in mdadm --uuid=\"$_uuid\" command",
+    "parse-kernel.sh properly quotes $p in modprobe \"$p\" — no command injection from rd.driver.pre/blacklist",
+    "nfsroot.sh properly quotes all arguments to mount_nfs — no injection",
+    "mdmon-pre-shutdown.sh inherits PATH=/usr/sbin:/usr/bin:/sbin:/bin from shutdown.sh — no PATH hijack in read-only initramfs",
+    "evm-enable.sh/ima-keys-load.sh/ima-policy-load.sh source config from mounted rootfs ($NEWROOT) — if rootfs is compromised, attacker already has root",
+    "CMS scripts (cmssetup.sh, cmsifup.sh) are s390x-specific — CMS DASD content requires hypervisor-level access to tamper",
+    "cryptroot-ask.sh $cryptsetupopts built from build-time crypttab and hardcoded literals — not attacker-controlled",
+    "HARDENING: crypt-gpg-lib.sh gpg_decrypt() builds cmd string with unquoted $mntp/$keypath that gets eval'd via ask_for_password — kernel cmdline to eval injection",
+    "HARDENING: parse-nfsroot.sh interpolates $nfsdomain from kernel cmdline into sed replacement string — sed metacharacter injection",
+    "HARDENING: url-lib.sh appends unquoted proxy= kernel cmdline value to curl_args — curl argument injection (--upload-file etc.)",
+    "HARDENING: parse-bond.sh writes bondname unquoted in echo and uses it unquoted in output filename — inconsistent with other quoted variables",
+]
+
+dismiss = [
+    # Initramfs /tmp is private — no symlink races or file injection
+    "symlink.*modules\\.d.*",
+    "TOCTOU.*modules\\.d.*",
+    "symlink.*/tmp.*initramfs",
+    "symlink.*/tmp.*bridge",
+    "symlink.*/tmp.*bond",
+    "symlink.*/tmp.*vlan",
+    "symlink.*/tmp.*net\\.ifaces",
+    "symlink.*/tmp.*net\\..*\\.override",
+    "symlink.*/tmp.*cms\\.conf",
+    # Sourcing initramfs-internal files is safe (no other users)
+    ".*source.*/tmp.*\\.info",
+    ".*source.*/tmp.*\\.override",
+    ".*source.*/tmp.*cms\\.conf",
+    ".*untrusted.*source.*initramfs",
+    ".*file.inclusion.*/tmp.*dracut",
+    # Build-time env vars are root-controlled
+    "command.injection.*SYSTEMCTL",
+    "command.injection.*DRACUT_INSTALL",
+    "command.injection.*module-setup\\.sh.*environment",
+    # Kernel cmdline requires physical access
+    "command.injection.*parse-kernel\\.sh",
+    "command.injection.*shutdown\\.sh.*ACTION",
+    "command.injection.*mdraid_start\\.sh",
+    "command.injection.*nbdroot\\.sh",
+    "command.injection.*nfsroot\\.sh",
+    "command.injection.*cryptroot-ask\\.sh",
+    # Properly quoted where it matters
+    "command.injection.*modprobe",
+    "path.traversal.*initqueue\\.sh",
+    "path.traversal.*fips\\.sh.*BOOT_IMAGE",
+    "command.injection.*mdmon.*PATH",
+    # EVM/IMA source from mounted rootfs — already-root threat model
+    ".*evm-enable\\.sh.*privilege",
+    ".*ima-keys-load\\.sh.*privilege",
+    ".*ima-policy-load\\.sh.*privilege",
+    ".*source.*/etc/sysconfig/evm",
+    ".*source.*/etc/sysconfig/ima",
+    # Build/test/release scripts — not runtime
+    ".*tools/release\\.sh.*",
+    # NetworkManager hooks baked into initramfs at build time
+    ".*source_hook.*initqueue",
+    ".*nm-run\\.sh.*source_hook",
+    # CMS/s390x — hypervisor-controlled input
+    ".*cmssetup\\.sh.*",
+    ".*cmsifup\\.sh.*",
+]

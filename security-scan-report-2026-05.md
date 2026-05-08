@@ -1,6 +1,6 @@
 # openSUSE Security Scanner — Findings Report
 
-**Date:** 2026-05-02
+**Date:** 2026-05-08
 **Scanner:** opensuse-security-scanner (three-stage pipeline)
 **Triage model:** GPT-OSS 20B / Nemotron Nano 30B
 **Reasoning model:** Nemotron Super 49B / Gemma 4 31B
@@ -11,10 +11,10 @@
 
 ## Executive Summary
 
-Six packages scanned. One new vulnerability discovered and reported
+Seven packages scanned. One new vulnerability discovered and reported
 upstream (cockpit path traversal). Several low-severity issues and
 defense-in-depth observations documented. No remotely exploitable
-bugs found in zypper or libzypp.
+bugs found in zypper, libzypp, or dracut.
 
 | Package | Files scanned | Scanner findings | After verification |
 |---------|--------------|-----------------|-------------------|
@@ -23,7 +23,7 @@ bugs found in zypper or libzypp.
 | account-utils | ~80 | 27 verdicts, 12 REPORT | 0 real (all FP) |
 | zypper 1.14.96 | 211 | 136 findings, 93 High/Critical | 0 real (all FP) |
 | libzypp 17.38.7 | 1032 | 200 CONFIRMED | 0 remote, 2 low-local, 4 defense-in-depth |
-| dracut 110 | 352 | in progress | — |
+| dracut 110 | 352 | 191 findings | 0 real, 4 hardening |
 
 **False positive rate after verdict stage:** ~95-99% depending on package.
 **Value:** the scanner surfaces findings that warrant human review;
@@ -149,6 +149,59 @@ has a 1MB guard (`MAX_BODYLEN`).
 
 **Recommendation:** Apply the same 1MB cap to the classic path.
 
+### 7. dracut: crypt-gpg-lib.sh eval injection via kernel cmdline
+
+**Severity:** Low (requires physical access / bootloader compromise)
+**File:** `modules.d/73crypt-gpg/crypt-gpg-lib.sh:54-62`
+
+The `gpg_decrypt()` function builds a command string with unquoted
+`$mntp` and `$keypath` variables: `cmd="gpg $opts --decrypt $mntp/$keypath"`.
+This string is passed to `ask_for_password --cmd` which ultimately
+`eval`'s it in `crypt-lib.sh`. Values come from the `rd.luks.key=`
+kernel command line parameter. Shell metacharacters in the key path
+would be interpreted.
+
+**Recommendation:** Quote variables within the cmd string:
+`cmd="gpg $opts --decrypt \"$mntp/$keypath\""`
+
+### 8. dracut: parse-nfsroot.sh sed metacharacter injection
+
+**Severity:** Low (requires physical access)
+**File:** `modules.d/74nfs/parse-nfsroot.sh:90-98`
+
+`$nfsdomain` from `rd.nfs.domain` kernel cmdline is interpolated
+directly into a `sed` replacement string. Characters like `/`, `&`,
+`\` would alter the sed behavior, corrupting `/etc/idmapd.conf` in
+the initramfs.
+
+**Recommendation:** Escape sed metacharacters in `$nfsdomain` or use
+`awk` for the replacement.
+
+### 9. dracut: url-lib.sh curl argument injection via proxy=
+
+**Severity:** Low (requires physical access)
+**File:** `modules.d/45url-lib/url-lib.sh:62-63`
+
+The `proxy=` kernel cmdline value is appended unquoted to `curl_args`
+and later expanded unquoted in `curl $curl_args`. An attacker who
+controls the kernel cmdline could inject additional curl options
+(e.g., `--upload-file /etc/shadow`). The `--` separator on the curl
+command line only protects the URL argument, not earlier options.
+
+**Recommendation:** Quote the proxy value or validate it as a URL.
+
+### 10. dracut: parse-bond.sh unquoted bondname
+
+**Severity:** Low (requires physical access)
+**File:** `modules.d/35network-legacy/parse-bond.sh:71-75`
+
+`bondname` from the `bond=` kernel cmdline parameter is written
+unquoted in `echo "bondname=$bondname"` and used unquoted in the
+output filename. Inconsistent with other variables in the same block
+which are properly quoted.
+
+**Recommendation:** Quote bondname: `echo "bondname=\"$bondname\""`
+
 ---
 
 ## Previously known findings (PAM)
@@ -176,6 +229,14 @@ These were previously reported and are included for completeness.
   positives. Key patterns: `str::Format` args misidentified as format
   strings, PAGER env injection (standard UNIX, not a boundary violation),
   signal handler code quality issues (not security).
+
+- **dracut 110**: 191 findings from 352 files, 23 REPORT + 13
+  REPORT_IF_CONFIGURED. All verified as false positives or low-priority
+  hardening. The scanner's threat model did not account for the initramfs
+  execution context: single-user environment, private /tmp, kernel
+  command line as the only external input (requires physical access).
+  Four shell quoting issues documented as upstream hardening (items 7-10
+  above) — none remotely exploitable.
 
 ---
 
