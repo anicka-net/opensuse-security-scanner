@@ -9,7 +9,7 @@ Three-stage pipeline with pluggable backends at each stage:
   verdict     → Verifies exploitability, eliminates FPs (default: Claude via CLI)
 
 Every stage can use any backend: ollama, openai-compatible (llama.cpp, vLLM),
-nvidia nim, claude, gemini, or codex. Configure via CLI flags or config file.
+nvidia nim, claude, gemini, codex, or deepseek. Configure via CLI flags or config file.
 
 Usage:
   # Defaults (ollama triage + reasoning, no verdict)
@@ -34,6 +34,11 @@ Usage:
     --triage gemini/flash \\
     --reasoning claude/sonnet \\
     --verdict claude/opus
+
+  # DeepSeek API (key from ~/.deepseek_api_key or DEEPSEEK_API_KEY env)
+  scan.py --source-dir /path/to/src \\
+    --triage deepseek/deepseek-v4-flash \\
+    --verdict deepseek/deepseek-v4-pro
 
   # llama.cpp server on custom port
   scan.py --source-dir /path/to/src \\
@@ -484,6 +489,56 @@ class NIMBackend(Backend):
         return f"nim/{self.model}"
 
 
+class DeepSeekBackend(Backend):
+    """DeepSeek API backend (api.deepseek.com)."""
+
+    DEEPSEEK_BASE = "https://api.deepseek.com"
+
+    def __init__(self, model: str, base_url: str = ""):
+        self.model = model
+        self.base_url = (base_url or self.DEEPSEEK_BASE).rstrip("/")
+        self.api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if not self.api_key:
+            key_file = os.path.expanduser("~/.deepseek_api_key")
+            if os.path.exists(key_file):
+                self.api_key = open(key_file).read().strip()
+
+    def query(self, system: str, user: str, max_tokens: int = 16384) -> str:
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": user})
+        try:
+            resp = requests.post(
+                f"{self.base_url}/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "max_tokens": max_tokens,
+                },
+                timeout=600,
+            )
+            if resp.status_code == 500:
+                return "[ERROR: context exceeded]"
+            resp.raise_for_status()
+            msg = resp.json()["choices"][0]["message"]
+            content = (msg.get("content") or "").strip()
+            reasoning = (msg.get("reasoning_content") or "").strip()
+            if content:
+                return content
+            if reasoning:
+                return reasoning
+            return "[ERROR: deepseek: empty response]"
+        except Exception as e:
+            return f"[ERROR: deepseek: {e}]"
+
+    def __repr__(self):
+        return f"deepseek/{self.model}"
+
+
 class ClaudeBackend(Backend):
     """Claude via CLI (uses subscription, no API key needed).
 
@@ -664,6 +719,8 @@ def parse_backend_spec(spec: str) -> Backend:
       gemini/pro                         → GeminiBackend
       codex/o3-mini                      → CodexBackend
       codex/gpt-4.1                      → CodexBackend
+      deepseek/deepseek-v4-flash         → DeepSeekBackend
+      deepseek/deepseek-v4-pro           → DeepSeekBackend
     """
     if "/" not in spec:
         raise ValueError(f"Invalid backend spec: {spec!r}. Use 'backend/model' format.")
@@ -688,9 +745,11 @@ def parse_backend_spec(spec: str) -> Backend:
         return GeminiBackend(model)
     elif backend_type == "codex":
         return CodexBackend(model)
+    elif backend_type == "deepseek":
+        return DeepSeekBackend(model, url or "")
     else:
         raise ValueError(f"Unknown backend: {backend_type!r}. "
-                         f"Use: ollama, openai, nim, claude, gemini, codex")
+                         f"Use: ollama, openai, nim, claude, gemini, codex, deepseek")
 
 
 # ── File handling ───────────────────────────────────────────────────────
