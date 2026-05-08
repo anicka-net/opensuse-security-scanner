@@ -11,10 +11,12 @@
 
 ## Executive Summary
 
-Seven packages scanned. One new vulnerability discovered and reported
-upstream (cockpit path traversal). Several low-severity issues and
-defense-in-depth observations documented. No remotely exploitable
-bugs found in zypper, libzypp, or dracut.
+Eight packages scanned. One new vulnerability discovered and reported
+upstream (cockpit path traversal). Two local bugs found in
+multipath-tools (DASD partition overflow, NVMe ANA integer overflow).
+Several low-severity issues and defense-in-depth observations
+documented. No remotely exploitable bugs found in zypper, libzypp,
+dracut, or multipath-tools.
 
 | Package | Files scanned | Scanner findings | After verification |
 |---------|--------------|-----------------|-------------------|
@@ -24,6 +26,7 @@ bugs found in zypper, libzypp, or dracut.
 | zypper 1.14.96 | 211 | 136 findings, 93 High/Critical | 0 real (all FP) |
 | libzypp 17.38.7 | 1032 | 200 CONFIRMED | 0 remote, 2 low-local, 4 defense-in-depth |
 | dracut 110 | 352 | 191 findings | 0 real, 4 hardening |
+| multipath-tools 0.14.3 | 208 | ~80 findings | **2 bugs** (local), 0 remote |
 
 **False positive rate after verdict stage:** ~95-99% depending on package.
 **Value:** the scanner surfaces findings that warrant human review;
@@ -201,6 +204,42 @@ output filename. Inconsistent with other variables in the same block
 which are properly quoted.
 
 **Recommendation:** Quote bondname: `echo "bondname=\"$bondname\""`
+
+### 11. multipath-tools: kpartx/dasd.c DASD partition counter overflow [NEW]
+
+**Severity:** Medium (requires malicious/corrupted DASD disk image, s390x only)
+**File:** `kpartx/dasd.c:220-247`
+
+`read_dasd_pt()` receives `unsigned int ns` (array size, 256 =
+MAXSLICES) but marks it `__attribute__((unused))` and never references
+it. The VOL1 partition loop increments `counter` without bounds
+checking, writing `sp[counter].start` and `sp[counter].size` for each
+valid FMT1/FMT8 label found on disk. A DASD image with >256 partition
+entries causes a stack buffer overflow.
+
+For comparison, `dos.c` in the same directory properly checks
+`if (n < ns)` before writing.
+
+**Recommendation:** Remove `__attribute__((unused))` from `ns` and add
+`if (counter >= ns) break;` to the partition loop.
+
+### 12. multipath-tools: ana.c NVMe ANA integer overflow [NEW]
+
+**Severity:** Medium (requires malicious NVMe device, physical access)
+**File:** `libmultipath/prioritizers/ana.c:138-149`
+
+`get_ana_info()` computes ANA log buffer size from NVMe Identify
+Controller fields `ctrl.nanagrpid` and `ctrl.mnan`. These are
+untrusted device-supplied 32-bit values. The multiplication
+`nanagrpid * sizeof(struct nvme_ana_group_desc)` (32 bytes) can:
+- On 32-bit: overflow to a small value, causing heap buffer overflow
+  when the NVMe ioctl fills the undersized buffer
+- On 64-bit: allocate ~8 GB from a single malicious field, causing DoS
+
+Code was copied from nvme-cli which has the same pattern.
+
+**Recommendation:** Add sanity bounds on `nanagrpid` and `mnan` before
+multiplication, or use overflow-safe multiply (e.g., `__builtin_mul_overflow`).
 
 ---
 

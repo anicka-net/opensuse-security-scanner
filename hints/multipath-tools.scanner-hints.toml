@@ -1,0 +1,50 @@
+# Package hints for multipath-tools 0.14.3
+# Verified from 2026-05-08 source audit (3 parallel agents + manual review).
+# 208 production files scanned, 2 real bugs found.
+
+facts = [
+    "multipathd unix socket uses SO_PEERCRED for authentication — non-root restricted to VRB_LIST (read-only) commands only",
+    "Socket permissions are 0666 (not 0777) — intentional design for monitoring access, mutations require root UID",
+    "Abstract socket (@/org/kernel/linux/storage/multipathd) uses same SO_PEERCRED check — network namespace scoped",
+    "mpath_recv_reply_len enforces MAX_REPLY_LEN (32MB) cap — allocation is bounded, not unbounded",
+    "_recv_packet is client-side only (multipathc, libmpathpersist) receiving from trusted daemon — not attack surface",
+    "Server-side command reads use recv() with MAX_CMD_LEN (512 bytes) bound in uxlsnr.c",
+    "msort_r alloca path only reachable when size < 1024 — only caller passes s=sizeof(void*), so n < 128 for this path",
+    "msort_r indirect sorting path (s > 32) is dead code — only caller passes s=8",
+    "vector_move_up: all callers in pgpolicies.c pass dest >= 0 — negative index path unreachable",
+    "libdmmp JSON comes from local multipathd IPC socket (root-only) — not externally controlled",
+    "sysfs_is_multipathed: UUID buffer correctly sized (WWID_SIZE + UUID_PREFIX_LEN), explicit overflow guard at line 310",
+    "xstrncpy: trivial safe-strncpy wrapper, single caller always passes valid pointers, comment documents contract",
+    "REAL BUG: kpartx/dasd.c read_dasd_pt writes sp[counter] without bounds check — ns parameter marked __attribute__((unused)). dos.c checks if (n < ns). s390x DASD only.",
+    "REAL BUG: libmultipath/prioritizers/ana.c get_ana_info uses ctrl.nanagrpid/mnan from NVMe controller (untrusted device data) in allocation size without overflow check. 32-bit heap overflow, 64-bit DoS.",
+]
+
+dismiss = [
+    # Socket security model is sound (SO_PEERCRED + VRB_LIST restriction)
+    ".*uxsock.*permission",
+    ".*uxsock.*0777",
+    ".*uxsock.*world.writable",
+    ".*uxsock.*privilege.escalation",
+    ".*uxsock.*authentication",
+    ".*uxsock.*unbounded.*alloc",
+    ".*_recv_packet.*overflow",
+    ".*_recv_packet.*denial",
+    # msort is glibc code with narrower usage here — overflow paths unreachable
+    ".*msort.*alloca.*overflow",
+    ".*msort.*pointer.*overflow",
+    ".*msort.*integer.*overflow",
+    # vector_move_up negative index unreachable from callers
+    ".*vector_move_up.*negative",
+    ".*vector_move_up.*out.of.bounds",
+    # libdmmp receives from local trusted daemon
+    ".*libdmmp.*integer.*overflow",
+    ".*libdmmp.*heap.*overflow",
+    # sysfs.c has correct bounds checking
+    ".*sysfs_is_multipathed.*overflow",
+    ".*sysfs.*UUID.*overflow",
+    # xstrncpy is a safe wrapper
+    ".*xstrncpy.*null",
+    ".*xstrncpy.*dereference",
+    # Third-party vendored code
+    ".*valgrind\\.h.*",
+]
